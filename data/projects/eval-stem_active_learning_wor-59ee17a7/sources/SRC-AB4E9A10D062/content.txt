@@ -1,0 +1,10 @@
+Title: Chemical and Biological Reaction Engineering — Lecture Notes Overview
+Publisher: MIT OpenCourseWare
+Source: https://ocw.mit.edu/courses/10-37-chemical-and-biological-reaction-engineering-spring-2007/pages/lecture-notes/
+Authority: external open course material
+License: MIT OpenCourseWare terms; course page identifies these as OCW materials
+
+Course level: Undergraduate chemical engineering.
+
+Relevant content summary:
+The course begins with reaction stoichiometry, reaction extent, concentration measures, single reactions, reaction networks, and bioreaction pathways. It then distinguishes reaction rates from reaction mechanisms and covers rate laws, the Arrhenius equation, elementary and non-elementary reactions, reversible reactions, and catalysis. Later material addresses steady-state approximations, rate-limiting steps, ideal reactor models, selectivity, conversion, experimental determination of kinetic parameters, and model discrimination. The lecture-note page cautions that the notes are preliminary and may contain errors, so technical claims require instructor verification.

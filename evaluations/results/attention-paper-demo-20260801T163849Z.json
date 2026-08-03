@@ -1,0 +1,81 @@
+{
+  "created_at": "2026-08-01T16:38:49.307707+00:00",
+  "project": {
+    "id": "project-1a82608f2c07463a",
+    "name": "Attention Is All You Need - Source-Grounded Demo",
+    "course_name": "Graduate Seminar: Transformer Foundations",
+    "level": "Graduate",
+    "class_time": "90 minutes",
+    "outcome": "Explain the Transformer architecture and evaluate claims using evidence and limitations from Vaswani et al. (2017).",
+    "mode": "Auto",
+    "notes": "Use only the uploaded arXiv paper for factual claims. Clearly separate reported results from later interpretations.",
+    "created_at": "2026-08-01T16:32:18.239359+00:00",
+    "updated_at": "2026-08-01T16:32:18.239359+00:00"
+  },
+  "project_url": "http://127.0.0.1:8001/?project=project-1a82608f2c07463a",
+  "paper": {
+    "url": "https://arxiv.org/pdf/1706.03762",
+    "filename": "attention-is-all-you-need.pdf",
+    "pages": 15,
+    "bytes": 2215244,
+    "source_id": "SRC-BD984A99928A"
+  },
+  "chat_checks": {
+    "request_completed": false,
+    "source_used": false,
+    "skill_loaded": false,
+    "raw_reasoning_filtered": true,
+    "transformer_content": false
+  },
+  "chat_error": "504: {\"detail\":\"Purdue GenAI request timed out\"}",
+  "artifacts": [
+    {
+      "id": "ART-6CE64FEED18C48E3",
+      "kind": "slides",
+      "title": "Attention Is All You Need: Transformer Foundations",
+      "file_format": "pptx",
+      "source_ids": [
+        "SRC-BD984A99928A"
+      ],
+      "validation": {
+        "bytes": 45391,
+        "office_prefix": "ppt/",
+        "valid": true
+      }
+    },
+    {
+      "id": "ART-D7F8D0787FB847F6",
+      "kind": "document",
+      "title": "Instructor Guide: Teaching the Transformer Paper",
+      "file_format": "docx",
+      "source_ids": [
+        "SRC-BD984A99928A"
+      ],
+      "validation": {
+        "bytes": 39693,
+        "office_prefix": "word/",
+        "valid": true
+      }
+    },
+    {
+      "id": "ART-C9B1BE70798F45B9",
+      "kind": "worksheet",
+      "title": "Transformer Paper Evidence Worksheet",
+      "file_format": "docx",
+      "source_ids": [
+        "SRC-BD984A99928A"
+      ],
+      "validation": {
+        "bytes": 39512,
+        "office_prefix": "word/",
+        "valid": true
+      }
+    }
+  ],
+  "package_checks": {
+    "conversation": true,
+    "project_metadata": true,
+    "slides": true,
+    "documents": true
+  }
+}

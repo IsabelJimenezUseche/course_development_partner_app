@@ -1,0 +1,17 @@
+{
+  "source_id": "SRC-BD984A99928A",
+  "filename": "attention-is-all-you-need.pdf",
+  "media_type": "application/pdf",
+  "size_bytes": 2215244,
+  "sha256": "bdfaa68d8984f0dc02beaca527b76f207d99b666d31d1da728ee0728182df697",
+  "uploaded_at": "2026-08-01T16:32:19.028703+00:00",
+  "status": "ready",
+  "character_count": 39756,
+  "truncated": false,
+  "vector_index": {
+    "algorithm": "local-hashed-term-cosine-v1",
+    "dimensions": 384,
+    "chunks": 27,
+    "metadata": "extractive-main-idea-v3"
+  }
+}
