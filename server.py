@@ -9,6 +9,8 @@ import re
 import shutil
 import socket
 import sqlite3
+import subprocess
+import sys
 import zipfile
 from collections import Counter
 from dataclasses import dataclass
@@ -60,6 +62,7 @@ class Settings:
     host: str
     port: int
     port_search_limit: int
+    work_dir: Path
     data_dir: Path
     upload_max_bytes: int
     source_max_extracted_chars: int
@@ -99,20 +102,33 @@ def _float_env(name: str, default: float, minimum: float) -> float:
     return value
 
 
+def _resolve_dir(value: str, base: Path) -> Path:
+    """Expand `~`, then anchor a relative path to `base`."""
+    path = Path(value).expanduser()
+    if not path.is_absolute():
+        path = base / path
+    return path.resolve()
+
+
 def get_settings() -> Settings:
-    configured_data_dir = Path(os.getenv("APP_DATA_DIR", "./data"))
-    if not configured_data_dir.is_absolute():
-        configured_data_dir = APP_DIR / configured_data_dir
-    configured_skill_dir = Path(
-        os.getenv("COURSE_SKILL_DIR", "../course-development-partner")
+    # APP_WORK_DIR is the base that relative APP_DATA_DIR and COURSE_SKILL_DIR
+    # values resolve against, so the writable data directory can live outside the
+    # app install. It defaults to the app directory, which leaves the previous
+    # behaviour and both stock defaults unchanged.
+    work_dir = _resolve_dir(os.getenv("APP_WORK_DIR", "."), APP_DIR)
+    configured_data_dir = _resolve_dir(os.getenv("APP_DATA_DIR", "./data"), work_dir)
+    configured_skill_dir = _resolve_dir(
+        os.getenv(
+            "COURSE_SKILL_DIR", "../course_development_partner/course-development-partner"
+        ),
+        work_dir,
     )
-    if not configured_skill_dir.is_absolute():
-        configured_skill_dir = APP_DIR / configured_skill_dir
     return Settings(
         host=os.getenv("APP_HOST", "127.0.0.1"),
         port=_int_env("APP_PORT", 8001, 1, 65535),
         port_search_limit=_int_env("APP_PORT_SEARCH_LIMIT", 50, 1, 1000),
-        data_dir=configured_data_dir.resolve(),
+        work_dir=work_dir,
+        data_dir=configured_data_dir,
         upload_max_bytes=_int_env(
             "UPLOAD_MAX_BYTES", 20 * 1024 * 1024, 1024, 100 * 1024 * 1024
         ),
@@ -122,7 +138,7 @@ def get_settings() -> Settings:
         source_max_uncompressed_bytes=_int_env(
             "SOURCE_MAX_UNCOMPRESSED_BYTES", 100 * 1024 * 1024, 1024, 1024 * 1024 * 1024
         ),
-        skill_dir=configured_skill_dir.resolve(),
+        skill_dir=configured_skill_dir,
         genai_base_url=os.getenv(
             "PURDUE_GENAI_BASE_URL", "https://genai.rcac.purdue.edu"
         ),
@@ -179,6 +195,7 @@ class ChatRequest(BaseModel):
         "assessment",
         "accessibility",
         "course",
+        "stem",
         "engineering",
         "validation",
     ] = "auto"
@@ -190,7 +207,7 @@ class ProjectCreate(BaseModel):
     level: str = Field(default="Undergraduate", max_length=80)
     class_time: str = Field(default="50 minutes", max_length=80)
     outcome: str = Field(default="", max_length=4000)
-    mode: Literal["Studio", "Guided", "Rapid", "Auto"] = "Studio"
+    mode: Literal["Co-design", "Guided", "Rapid", "Auto"] = "Co-design"
     notes: str = Field(default="", max_length=20_000)
 
 
@@ -200,7 +217,7 @@ class ProjectUpdate(BaseModel):
     level: Optional[str] = Field(default=None, max_length=80)
     class_time: Optional[str] = Field(default=None, max_length=80)
     outcome: Optional[str] = Field(default=None, max_length=4000)
-    mode: Optional[Literal["Studio", "Guided", "Rapid", "Auto"]] = None
+    mode: Optional[Literal["Co-design", "Guided", "Rapid", "Auto"]] = None
     notes: Optional[str] = Field(default=None, max_length=20_000)
 
 
@@ -216,11 +233,11 @@ class ArtifactTableSpec(BaseModel):
 
 class ArtifactSectionSpec(BaseModel):
     heading: str = Field(min_length=1, max_length=120)
-    body: str = Field(default="", max_length=700)
-    bullets: list[str] = Field(default_factory=list, max_length=7)
-    prompts: list[str] = Field(default_factory=list, max_length=6)
-    checklist: list[str] = Field(default_factory=list, max_length=8)
-    response_lines: int = Field(default=3, ge=1, le=6)
+    body: str = Field(default="", max_length=4000)
+    bullets: list[str] = Field(default_factory=list, max_length=20)
+    prompts: list[str] = Field(default_factory=list, max_length=12)
+    checklist: list[str] = Field(default_factory=list, max_length=12)
+    response_lines: int = Field(default=3, ge=0, le=12)
     table: Optional[ArtifactTableSpec] = None
 
 
@@ -230,6 +247,12 @@ class ArtifactToolRequest(BaseModel):
     subtitle: str = Field(default="", max_length=240)
     sections: list[ArtifactSectionSpec] = Field(min_length=1, max_length=12)
     source_ids: list[str] = Field(default_factory=list, max_length=20)
+
+
+class StateFileWrite(BaseModel):
+    file: str = Field(min_length=1, max_length=80)
+    content: str = Field(min_length=1, max_length=200_000)
+    design_profile: Literal["establish", "produce", "handoff"] = "establish"
 
 
 ALLOWED_SOURCE_EXTENSIONS = {".pdf", ".docx", ".pptx", ".xlsx", ".txt", ".md", ".csv"}
@@ -248,8 +271,60 @@ SKILL_REFERENCE_ROUTES = {
     "assessment": ["assessment-quality.md", "artifact-patterns.md"],
     "accessibility": ["accessibility-and-compliance.md", "artifact-patterns.md"],
     "course": ["course-coherence-and-implementation.md", "design-workflow.md"],
-    "engineering": ["engineering-authenticity.md", "artifact-patterns.md"],
+    "stem": ["stem-authenticity.md", "artifact-patterns.md"],
     "validation": ["validation-checklists.md", "portability.md"],
+}
+# Profile names retired by an upstream skill revision, kept so that stored message
+# metadata and older clients keep resolving.
+SKILL_PROFILE_ALIASES = {"engineering": "stem"}
+# SKILL.md instructs the model to create each portable state file "from" an asset
+# template, so the template has to reach the prompt or the structure is guesswork.
+SKILL_ASSET_ROUTES = {
+    "establish": ["course-design-brief.md", "project-index.md"],
+    "design": ["alignment-map.md", "design-log.md"],
+    "artifact": ["lesson-storyboard.md", "artifact-manifest.md"],
+    "assessment": ["assessment-blueprint.md", "alignment-map.md"],
+    "accessibility": ["accessibility-review.md"],
+    "course": ["course-curriculum-map.md", "implementation-plan.md"],
+    "stem": ["safety-review.md", "context-brief.md"],
+    "validation": ["project-index.md", "artifact-manifest.md"],
+}
+# Portable state files the app can hold, mapped to the skill validator that checks
+# each one. This registry is also the write allow-list: a filename that is not a key
+# here never reaches disk, which keeps path traversal out of the state directory.
+# `None` means the skill ships no validator for that file; it is still stored and
+# indexed, because validate_project.py reads the whole directory.
+STATE_FILE_VALIDATORS = {
+    "course-design-brief.md": "validate_design_state.py",
+    "alignment-map.md": "validate_alignment_map.py",
+    "assessment-blueprint.md": "validate_assessment_blueprint.py",
+    "course-curriculum-map.md": "validate_course_curriculum_map.py",
+    "artifact-manifest.md": "validate_artifact_manifest.py",
+    "project-index.md": None,
+    "accessibility-review.md": None,
+    "capability-manifest.md": None,
+    "context-brief.md": None,
+    "design-log.md": None,
+    "implementation-evidence-plan.md": None,
+    "implementation-plan.md": None,
+    "lesson-storyboard.md": None,
+    "production-plan.md": None,
+    "safety-review.md": None,
+    "source-register.md": None,
+}
+# validate_project.py takes the project directory rather than a single file.
+PROJECT_VALIDATOR = "validate_project.py"
+DESIGN_PROFILES = ("establish", "produce", "handoff")
+VALIDATOR_TIMEOUT_SECONDS = 30
+# Shared exit-code convention across every scripts/validate_*.py in the skill.
+VALIDATOR_EXIT_STATUS = {0: "pass", 1: "fail", 2: "incomplete"}
+# Prefixes the skill's validators use on stdout. Anything else is treated as prose.
+VALIDATOR_LEVELS = {
+    "ERROR": "error",
+    "GAP": "gap",
+    "ISSUE": "issue",
+    "INCOMPLETE": "incomplete",
+    "OK": "ok",
 }
 LIMITED_MODEL_RELIABILITY_OVERLAY = (
     "Reliability overlay for this limited-capability model:\n"
@@ -263,6 +338,24 @@ LIMITED_MODEL_RELIABILITY_OVERLAY = (
     "criterion totals when they appear.\n"
     "- Keep assumptions, open questions, and required instructor review visible."
 )
+PROFESSOR_INTERACTION_CONTRACT = (
+    "Professor-facing interaction contract:\n"
+    "- The educator knows the subject and their students; the app owns SKILL routes, "
+    "templates, schemas, state files, validators, artifact specifications, and rendering.\n"
+    "- Ask only for missing information that would materially change the teaching result. "
+    "Ask no more than three short, direct questions in one response.\n"
+    "- Use ordinary teaching language. Never ask the educator for an outcome ID, cognitive-"
+    "demand label, assessment blueprint, Markdown, JSON, schema, SKILL file, validator, or "
+    "project-state filename.\n"
+    "- For a lesson, prioritize what students should be able to do, what they already know "
+    "or struggle with, and the available time or setting.\n"
+    "- For a quiz, prioritize whether it is practice or graded, what students should "
+    "demonstrate, and the available time and resources.\n"
+    "- If the missing detail is reversible, state a reasonable assumption and continue. "
+    "Do not turn an internal production route into a choice for the professor.\n"
+    "- Decision-card labels must be complete, plain-language teaching choices under 60 "
+    "characters; never use a label as a form asking the professor to provide metadata."
+)
 STRUCTURED_DECISION_CONTRACT = (
     "When the next useful interaction requires the instructor to choose among alternatives, "
     "end the response with exactly one fenced `decision` JSON block using this schema: "
@@ -270,6 +363,17 @@ STRUCTURED_DECISION_CONTRACT = (
     '"description":"Consequence or tradeoff","value":"Text to send if chosen"}]}. '
     "Provide two or three mutually exclusive options. Put the recommended option first and "
     "include '(Recommended)' in its label. Do not emit this block when a choice is not needed."
+)
+STATE_FILE_CONTRACT = (
+    "When the workflow calls for creating or updating a portable state file, include "
+    "exactly one fenced `state_file` JSON block at the end. Use this schema: "
+    '{"file":"alignment-map.md","content":"<complete Markdown file>"}. '
+    "Allowed file names: " + ", ".join(sorted(STATE_FILE_VALIDATORS)) + ". "
+    "Reproduce the supplied template's headings, table columns, and schema-version line "
+    "exactly, and write the whole file rather than a fragment, because the local "
+    "validator parses it structurally and reports the result back to the instructor. "
+    "Use `none` only where the template permits it, and never `TBD` or a blank cell as "
+    "evidence. Emit at most one state_file block per response."
 )
 ARTIFACT_TOOL_CONTRACT = (
     "When the instructor explicitly asks for a finished slide deck, Word document, or "
@@ -302,6 +406,7 @@ ENVIRONMENT_FIELDS = {
     "APP_HOST": {"label": "App host", "group": "Local server", "secret": False, "restart": True},
     "APP_PORT": {"label": "Preferred port", "group": "Local server", "secret": False, "restart": True},
     "APP_PORT_SEARCH_LIMIT": {"label": "Fallback port range", "group": "Local server", "secret": False, "restart": True},
+    "APP_WORK_DIR": {"label": "Working directory (base for relative paths)", "group": "Local storage", "secret": False, "restart": True},
     "APP_DATA_DIR": {"label": "Project data directory", "group": "Local storage", "secret": False, "restart": False},
     "COURSE_SKILL_DIR": {"label": "Course SKILL directory", "group": "Local storage", "secret": False, "restart": False},
     "UPLOAD_MAX_BYTES": {"label": "Maximum upload bytes", "group": "Local storage", "secret": False, "restart": False},
@@ -318,7 +423,10 @@ def _infer_skill_profile(messages: list[ChatMessage]) -> str:
     routes = [
         ("assessment", ("assessment", "exam", "quiz", "rubric", "grading", "score")),
         ("accessibility", ("accessibility", "accessible", "ada", "wcag", "accommodation")),
-        ("engineering", ("engineering", "safety", "risk", "constraint", "stakeholder")),
+        ("stem", (
+            "engineering", "computing", "laborator", "hazard", "safety", "uncertainty",
+            "risk", "constraint", "stakeholder", "sociotechnical",
+        )),
         ("course", ("course map", "curriculum", "multi-week", "semester", "workload")),
         ("artifact", ("worksheet", "lesson", "activity", "slides", "study guide", "artifact")),
         ("validation", ("validate", "review", "audit", "check", "finalize")),
@@ -331,6 +439,7 @@ def _infer_skill_profile(messages: list[ChatMessage]) -> str:
 
 
 def _load_skill_runtime(settings: Settings, profile: str) -> tuple[str, dict]:
+    profile = SKILL_PROFILE_ALIASES.get(profile, profile)
     if profile not in SKILL_REFERENCE_ROUTES:
         raise HTTPException(status_code=400, detail="Unknown skill profile")
 
@@ -360,12 +469,42 @@ def _load_skill_runtime(settings: Settings, profile: str) -> tuple[str, dict]:
         loaded_files.append(relative_file)
         sections.append(f"## Runtime file: {relative_file}\n\n{content}")
 
+    # Asset templates are supplied verbatim so the model fills a known structure
+    # instead of inventing one the validators would then reject.
+    loaded_assets = []
+    asset_sections = []
+    for asset_name in SKILL_ASSET_ROUTES.get(profile, []):
+        asset_path = settings.skill_dir / "assets" / asset_name
+        if not asset_path.is_file():
+            raise HTTPException(
+                status_code=503,
+                detail=f"Required skill asset is missing: assets/{asset_name}",
+            )
+        content = asset_path.read_text(encoding="utf-8")
+        digest.update(f"assets/{asset_name}".encode("utf-8"))
+        digest.update(content.encode("utf-8"))
+        loaded_assets.append(f"assets/{asset_name}")
+        asset_sections.append(
+            f"### Template: {asset_name}\n\n```markdown\n{content}\n```"
+        )
+    if asset_sections:
+        sections.append(
+            "## Portable state templates\n\n"
+            "Reproduce the table columns, field names, and schema-version lines exactly "
+            "when creating or updating these files; the local validators check them.\n\n"
+            + "\n\n".join(asset_sections)
+        )
+
     digest.update(b"limited-model-reliability-overlay")
     digest.update(LIMITED_MODEL_RELIABILITY_OVERLAY.encode("utf-8"))
+    digest.update(b"professor-interaction-contract")
+    digest.update(PROFESSOR_INTERACTION_CONTRACT.encode("utf-8"))
     digest.update(b"structured-decision-contract")
     digest.update(STRUCTURED_DECISION_CONTRACT.encode("utf-8"))
     digest.update(b"artifact-tool-contract")
     digest.update(ARTIFACT_TOOL_CONTRACT.encode("utf-8"))
+    digest.update(b"state-file-contract")
+    digest.update(STATE_FILE_CONTRACT.encode("utf-8"))
 
     prompt = (
         "Use the following locally installed Course Development Partner Agent Skill as "
@@ -375,9 +514,13 @@ def _load_skill_runtime(settings: Settings, profile: str) -> tuple[str, dict]:
         "accessibility, or assessment authority.\n\n"
         + LIMITED_MODEL_RELIABILITY_OVERLAY
         + "\n\n"
+        + PROFESSOR_INTERACTION_CONTRACT
+        + "\n\n"
         + STRUCTURED_DECISION_CONTRACT
         + "\n\n"
         + ARTIFACT_TOOL_CONTRACT
+        + "\n\n"
+        + STATE_FILE_CONTRACT
         + "\n\n"
         + "\n\n".join(sections)
     )
@@ -385,6 +528,7 @@ def _load_skill_runtime(settings: Settings, profile: str) -> tuple[str, dict]:
         "name": "course-development-partner",
         "profile": profile,
         "loaded_files": loaded_files,
+        "loaded_assets": loaded_assets,
         "fingerprint": digest.hexdigest()[:16],
         "reliability_overlay": {
             "target": "gpt-oss-120b",
@@ -399,6 +543,275 @@ def _project_sources_dir(settings: Settings, project_id: str) -> Path:
     if not PROJECT_ID_PATTERN.fullmatch(project_id):
         raise HTTPException(status_code=400, detail="Invalid project ID")
     return settings.data_dir / "projects" / project_id / "sources"
+
+
+def _project_state_dir(settings: Settings, project_id: str) -> Path:
+    """Portable project directory the skill's validate_project.py can read directly."""
+    if not PROJECT_ID_PATTERN.fullmatch(project_id):
+        raise HTTPException(status_code=400, detail="Invalid project ID")
+    return settings.data_dir / "projects" / project_id / "state"
+
+
+def _state_file_path(settings: Settings, project_id: str, filename: str) -> Path:
+    if filename not in STATE_FILE_VALIDATORS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Unknown portable state file: {filename}",
+        )
+    return _project_state_dir(settings, project_id) / filename
+
+
+def _parse_validator_output(stdout: str) -> list[dict]:
+    findings = []
+    for line in stdout.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        prefix, separator, message = line.partition(":")
+        level = VALIDATOR_LEVELS.get(prefix.strip().upper()) if separator else None
+        findings.append(
+            {
+                "level": level or "note",
+                "message": (message.strip() if level else line)[:2000],
+            }
+        )
+    return findings
+
+
+def _run_validator(
+    settings: Settings,
+    script_name: str,
+    target: Path,
+    extra_args: Optional[list[str]] = None,
+) -> dict:
+    """Run one skill validator over a target path and normalize its result.
+
+    The validators are part of the installed skill, not user input; the target path
+    is always one the app built itself, so nothing here interpolates a shell string.
+    """
+    script_path = settings.skill_dir / "scripts" / script_name
+    result = {
+        "script": f"scripts/{script_name}",
+        "target": target.name,
+        "status": "unavailable",
+        "exit_code": None,
+        "findings": [],
+    }
+    if not script_path.is_file():
+        result["findings"] = [
+            {"level": "note", "message": f"Validator not installed: scripts/{script_name}"}
+        ]
+        return result
+    try:
+        completed = subprocess.run(  # noqa: S603 - fixed argv, no shell
+            [sys.executable, str(script_path), str(target), *(extra_args or [])],
+            capture_output=True,
+            text=True,
+            timeout=VALIDATOR_TIMEOUT_SECONDS,
+            cwd=str(settings.skill_dir),
+        )
+    except subprocess.TimeoutExpired:
+        result["status"] = "timeout"
+        result["findings"] = [
+            {"level": "error", "message": f"Validator exceeded {VALIDATOR_TIMEOUT_SECONDS}s"}
+        ]
+        return result
+    except OSError as exc:
+        result["status"] = "error"
+        result["findings"] = [{"level": "error", "message": str(exc)[:2000]}]
+        return result
+
+    result["exit_code"] = completed.returncode
+    result["findings"] = _parse_validator_output(completed.stdout)
+    # Every skill validator uses the same convention: 0 clean, 1 hard errors,
+    # 2 gaps/incompleteness only. Keeping them apart matters, because a gap is a
+    # design step not taken yet whereas an error is a malformed file.
+    result["status"] = VALIDATOR_EXIT_STATUS.get(completed.returncode, "fail")
+    if result["status"] != "pass" and completed.stderr.strip() and not result["findings"]:
+        result["findings"] = [
+            {"level": "error", "message": completed.stderr.strip()[:2000]}
+        ]
+    return result
+
+
+def _validate_state_file(
+    settings: Settings,
+    project_id: str,
+    filename: str,
+    design_profile: str = "establish",
+) -> Optional[dict]:
+    script_name = STATE_FILE_VALIDATORS.get(filename)
+    if not script_name:
+        return None
+    path = _state_file_path(settings, project_id, filename)
+    if not path.is_file():
+        return None
+    extra_args = []
+    if script_name == "validate_design_state.py":
+        extra_args = ["--profile", design_profile]
+    elif script_name == "validate_assessment_blueprint.py":
+        alignment = _state_file_path(settings, project_id, "alignment-map.md")
+        if alignment.is_file():
+            extra_args = ["--alignment-map", str(alignment)]
+    elif script_name == "validate_artifact_manifest.py":
+        extra_args = ["--check-paths"]
+    return _run_validator(settings, script_name, path, extra_args)
+
+
+def _write_state_file(
+    settings: Settings, project_id: str, filename: str, content: str
+) -> dict:
+    path = _state_file_path(settings, project_id, filename)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    normalized = content.replace("\r\n", "\n").strip() + "\n"
+    path.write_text(normalized, encoding="utf-8")
+    return {
+        "file": filename,
+        "bytes": path.stat().st_size,
+        "updated_at": _utc_now(),
+        "has_validator": bool(STATE_FILE_VALIDATORS.get(filename)),
+    }
+
+
+def _list_state_files(settings: Settings, project_id: str) -> list[dict]:
+    state_dir = _project_state_dir(settings, project_id)
+    if not state_dir.is_dir():
+        return []
+    entries = []
+    for filename in sorted(STATE_FILE_VALIDATORS):
+        path = state_dir / filename
+        if not path.is_file():
+            continue
+        stat = path.stat()
+        entries.append(
+            {
+                "file": filename,
+                "bytes": stat.st_size,
+                "updated_at": datetime.fromtimestamp(
+                    stat.st_mtime, tz=timezone.utc
+                ).isoformat(timespec="seconds"),
+                "has_validator": bool(STATE_FILE_VALIDATORS.get(filename)),
+            }
+        )
+    return entries
+
+
+STATE_FILE_FENCE = re.compile(r"```state_file\s*(\{.*?\})\s*```", re.DOTALL | re.IGNORECASE)
+STATE_FILE_GENERIC_FENCE = re.compile(r"```(?:json)?\s*(\{.*?\})\s*```", re.DOTALL)
+STATE_FILE_BARE_OBJECT = re.compile(r"\{.*\}", re.DOTALL)
+STATE_FILE_MARKDOWN_FENCE = re.compile(
+    r"```(?:markdown|md)[ \t]*\n(?P<body>.*?)\n```",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _coerce_state_file(raw: str) -> Optional[dict]:
+    """Accept a candidate only if it names a state file the app is willing to write."""
+    try:
+        spec = StateFileWrite.model_validate(json.loads(raw))
+    except (json.JSONDecodeError, ValueError):
+        return None
+    if spec.file not in STATE_FILE_VALIDATORS:
+        return None
+    return spec.model_dump()
+
+
+def _extract_state_file(content: str) -> tuple[str, Optional[dict]]:
+    """Recover a state file whether or not gpt-oss honored the fenced contract.
+
+    The target model reliably produces the right JSON but often drops the
+    ```state_file fence, exactly as it drops the decision fence elsewhere in this
+    module. The allow-list check keeps the looser fallbacks from writing anything
+    the fenced path would have refused.
+    """
+    if '"file"' in content and '"content"' in content:
+        for pattern in (STATE_FILE_FENCE, STATE_FILE_GENERIC_FENCE, STATE_FILE_BARE_OBJECT):
+            matches = list(pattern.finditer(content))
+            if not matches:
+                continue
+            match = matches[-1]
+            raw = match.group(0) if pattern is STATE_FILE_BARE_OBJECT else match.group(1)
+            spec = _coerce_state_file(raw)
+            if spec is None:
+                continue
+            cleaned_content = (content[: match.start()] + content[match.end() :]).strip()
+            if not cleaned_content:
+                cleaned_content = f"Prepared `{spec['file']}` for project-state validation."
+            return cleaned_content, spec
+
+    # gpt-oss also returns the supplied asset template verbatim but labels it as
+    # Markdown instead of wrapping it in state_file JSON. A known H1 can recover
+    # that file without guessing a path: the allow-list remains the authority.
+    for match in reversed(list(STATE_FILE_MARKDOWN_FENCE.finditer(content))):
+        body = match.group("body").strip()
+        heading = re.search(r"^#\s+(.+?)\s*$", body, re.MULTILINE)
+        if not heading:
+            continue
+        heading_key = re.sub(r"[^a-z0-9]+", "", heading.group(1).lower())
+        filename = next(
+            (
+                candidate
+                for candidate in STATE_FILE_VALIDATORS
+                if re.sub(
+                    r"[^a-z0-9]+", "", Path(candidate).stem.replace("-", " ").lower()
+                )
+                == heading_key
+            ),
+            None,
+        )
+        if filename is None:
+            continue
+        spec = StateFileWrite(file=filename, content=body).model_dump()
+        cleaned_content = (content[: match.start()] + content[match.end() :]).strip()
+        if not cleaned_content:
+            cleaned_content = f"Prepared `{filename}` for project-state validation."
+        return cleaned_content, spec
+    return content.strip(), None
+
+
+def _validate_project_state(
+    settings: Settings, project_id: str, design_profile: str = "establish"
+) -> dict:
+    """Run every applicable skill validator over a project's portable state."""
+    if design_profile not in DESIGN_PROFILES:
+        raise HTTPException(status_code=400, detail="Unknown design profile")
+    state_dir = _project_state_dir(settings, project_id)
+    checks = []
+    for filename in sorted(STATE_FILE_VALIDATORS):
+        outcome = _validate_state_file(settings, project_id, filename, design_profile)
+        if outcome is not None:
+            checks.append(outcome)
+    # validate_project.py cross-checks identifiers across the indexed files, so it
+    # only means anything once project-index.md exists.
+    if (state_dir / "project-index.md").is_file():
+        checks.append(
+            _run_validator(
+                settings,
+                PROJECT_VALIDATOR,
+                state_dir,
+                ["--design-profile", design_profile],
+            )
+        )
+    statuses = {check["status"] for check in checks}
+    if not checks:
+        overall = "empty"
+    elif statuses == {"pass"}:
+        overall = "pass"
+    elif "fail" in statuses:
+        overall = "fail"
+    else:
+        overall = "incomplete"
+    return {
+        "project_id": project_id,
+        "design_profile": design_profile,
+        "status": overall,
+        "checks": checks,
+        "validated_at": _utc_now(),
+        "scope_note": (
+            "Structural checks only. Passing validators is bounded evidence and does "
+            "not replace educational, accessibility, or release review."
+        ),
+    }
 
 
 def _source_dir(settings: Settings, project_id: str, source_id: str) -> Path:
@@ -800,7 +1213,7 @@ def _database_connection(settings: Settings) -> sqlite3.Connection:
             level TEXT NOT NULL DEFAULT 'Undergraduate',
             class_time TEXT NOT NULL DEFAULT '50 minutes',
             outcome TEXT NOT NULL DEFAULT '',
-            mode TEXT NOT NULL DEFAULT 'Studio',
+            mode TEXT NOT NULL DEFAULT 'Co-design',
             notes TEXT NOT NULL DEFAULT '',
             hidden INTEGER NOT NULL DEFAULT 0,
             created_at TEXT NOT NULL,
@@ -848,6 +1261,11 @@ def _database_connection(settings: Settings) -> sqlite3.Connection:
     ):
         if column not in artifact_columns:
             connection.execute(f"ALTER TABLE artifacts ADD COLUMN {column} {definition}")
+    # The skill renamed the default collaboration mode; carry existing projects over
+    # so they still match the accepted mode values.
+    connection.execute(
+        "UPDATE projects SET mode = 'Co-design' WHERE mode = 'Studio'"
+    )
     connection.execute("PRAGMA optimize")
     connection.commit()
     return connection
@@ -895,7 +1313,7 @@ def _ensure_project(settings: Settings, project_id: str, *, hidden: bool = False
 
 
 def _render_markdown(content: str) -> str:
-    rendered = MARKDOWN_RENDERER.render(content)
+    rendered = MARKDOWN_RENDERER.render(_prepare_professor_display_content(content))
     return bleach.clean(
         rendered,
         tags=ALLOWED_HTML_TAGS,
@@ -905,23 +1323,53 @@ def _render_markdown(content: str) -> str:
     )
 
 
-def _extract_decision(content: str) -> tuple[str, Optional[dict]]:
-    pattern = re.compile(
-        r"```(?:decision|json)?\s*(\{.*?\})\s*```",
-        re.DOTALL | re.IGNORECASE,
-    )
-    matches = list(pattern.finditer(content))
-    if not matches:
-        return content.strip(), _infer_decision_from_questions(content)
-    match = matches[-1]
+def _load_model_json(raw: str) -> object:
+    """Parse model JSON while repairing unescaped Markdown/LaTeX backslashes."""
     try:
-        candidate = json.loads(match.group(1))
-    except json.JSONDecodeError:
-        return content.strip(), None
+        return json.loads(raw)
+    except json.JSONDecodeError as original_error:
+        repaired: list[str] = []
+        index = 0
+        while index < len(raw):
+            character = raw[index]
+            if character == "\\" and index + 1 < len(raw):
+                following = raw[index + 1]
+                if following in '"\\/bfnrtu':
+                    repaired.extend((character, following))
+                    index += 2
+                    continue
+                repaired.append("\\\\")
+                index += 1
+                continue
+            repaired.append(character)
+            index += 1
+        try:
+            return json.loads("".join(repaired))
+        except json.JSONDecodeError:
+            raise original_error
+
+
+def _trailing_json_object(content: str) -> Optional[tuple[int, int, dict]]:
+    """Return a JSON object that occupies the complete trailing part of a reply."""
+    for marker in reversed(list(re.finditer(r"(?m)^\s*\{", content))):
+        start = marker.start()
+        raw = content[start:].strip()
+        try:
+            candidate = _load_model_json(raw)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(candidate, dict):
+            return start, len(content), candidate
+    return None
+
+
+def _coerce_decision_payload(candidate: object) -> Optional[dict]:
+    if not isinstance(candidate, dict):
+        return None
     question = candidate.get("question")
     options = candidate.get("options")
     if not isinstance(question, str) or not question.strip() or not isinstance(options, list):
-        return content.strip(), None
+        return None
     cleaned_options = []
     for option in options[:3]:
         if not isinstance(option, dict):
@@ -938,9 +1386,34 @@ def _extract_decision(content: str) -> tuple[str, Optional[dict]]:
                 }
             )
     if len(cleaned_options) < 2:
-        return content.strip(), None
-    cleaned_content = (content[: match.start()] + content[match.end() :]).strip()
-    return cleaned_content, {"question": question.strip()[:500], "options": cleaned_options}
+        return None
+    return {"question": question.strip()[:500], "options": cleaned_options}
+
+
+def _extract_decision(content: str) -> tuple[str, Optional[dict]]:
+    pattern = re.compile(
+        r"```(?:decision|json)?\s*(\{.*?\})\s*```",
+        re.DOTALL | re.IGNORECASE,
+    )
+    matches = list(pattern.finditer(content))
+    for match in reversed(matches):
+        try:
+            candidate = _load_model_json(match.group(1))
+        except json.JSONDecodeError:
+            continue
+        decision = _coerce_decision_payload(candidate)
+        if decision:
+            cleaned_content = (content[: match.start()] + content[match.end() :]).strip()
+            return cleaned_content, decision
+
+    trailing = _trailing_json_object(content)
+    if trailing:
+        start, end, candidate = trailing
+        decision = _coerce_decision_payload(candidate)
+        if decision:
+            cleaned_content = (content[:start] + content[end:]).strip()
+            return cleaned_content, decision
+    return content.strip(), _infer_decision_from_questions(content)
 
 
 def _collaboration_mode_instruction(mode: str) -> str:
@@ -954,6 +1427,13 @@ def _collaboration_mode_instruction(mode: str) -> str:
             "request approval, or end with a feedback request. Select the strongest defensible recommendation, "
             "complete all safe work, label assumptions, report validation and limitations, and identify any "
             "nondelegable release blocker without converting it into a question."
+        )
+    elif mode == "Co-design":
+        instruction += (
+            " Speak as a teaching partner, not as a curriculum-production system. Ask at most "
+            "three plain-language questions only when their answers materially change the result. "
+            "Continue the workflow after the educator answers; do not repeatedly ask them to choose "
+            "which internal document, blueprint, rubric, or metadata they want to provide."
         )
     return instruction
 
@@ -977,22 +1457,242 @@ def _apply_auto_decision(content: str, decision: Optional[dict]) -> tuple[str, O
     return resolved_content, None, auto_decision
 
 
-def _extract_artifact_spec(content: str) -> tuple[str, Optional[dict]]:
-    pattern = re.compile(
-        r"```artifact_spec\s*(\{.*\})\s*```",
-        re.DOTALL | re.IGNORECASE,
+MARKDOWN_DOCUMENT_FENCE = re.compile(
+    r"```(?:markdown|md)[ \t]*\n(?P<body>.*?)\n```",
+    re.DOTALL | re.IGNORECASE,
+)
+ARTIFACT_SPEC_FENCES = (
+    re.compile(r"```artifact_spec\s*(\{.*?\})\s*```", re.DOTALL | re.IGNORECASE),
+    re.compile(r"```json\s*(\{.*?\})\s*```", re.DOTALL | re.IGNORECASE),
+)
+INTERNAL_PAYLOAD_FENCE = re.compile(
+    r"```(?:artifact_spec|state_file|json)\s*(?P<body>\{.*?\})\s*```",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _looks_like_markdown_document(body: str) -> bool:
+    lines = [line.strip() for line in body.splitlines() if line.strip()]
+    if not lines:
+        return False
+    return bool(
+        re.search(r"^#{1,6}\s+\S", body, re.MULTILINE)
+        or re.search(r"^\|.+\|\s*\n\|(?:\s*:?-{3,}:?\s*\|)+", body, re.MULTILINE)
+        or sum(line.startswith(("- ", "* ")) for line in lines) >= 2
     )
-    matches = list(pattern.finditer(content))
-    if not matches:
-        return content.strip(), None
-    match = matches[-1]
-    try:
-        candidate = json.loads(match.group(1))
-        spec = ArtifactToolRequest.model_validate(candidate)
-    except (json.JSONDecodeError, ValueError):
-        return content.strip(), None
-    cleaned_content = (content[: match.start()] + content[match.end() :]).strip()
-    return cleaned_content, spec.model_dump()
+
+
+def _unwrap_markdown_documents(content: str) -> str:
+    """Turn model-wrapped Markdown documents back into renderable Markdown.
+
+    A `markdown` fence is a transport mistake in this professor-facing app, not a
+    request to show source code. Other code fences, including Python examples,
+    remain untouched.
+    """
+
+    def replace(match: re.Match[str]) -> str:
+        body = match.group("body").strip()
+        return body if _looks_like_markdown_document(body) else match.group(0)
+
+    return MARKDOWN_DOCUMENT_FENCE.sub(replace, content).strip()
+
+
+def _extract_artifact_spec(content: str) -> tuple[str, Optional[dict]]:
+    """Extract a validated artifact contract from its named or generic JSON fence."""
+    for pattern in ARTIFACT_SPEC_FENCES:
+        matches = list(pattern.finditer(content))
+        for match in reversed(matches):
+            try:
+                candidate = _load_model_json(match.group(1))
+                spec = ArtifactToolRequest.model_validate(candidate)
+            except (json.JSONDecodeError, ValueError):
+                continue
+            cleaned_content = (content[: match.start()] + content[match.end() :]).strip()
+            if not cleaned_content:
+                cleaned_content = f"Prepared **{spec.title}** for artifact generation."
+            return cleaned_content, spec.model_dump()
+    trailing = _trailing_json_object(content)
+    if trailing:
+        start, end, candidate = trailing
+        try:
+            spec = ArtifactToolRequest.model_validate(candidate)
+        except ValueError:
+            pass
+        else:
+            cleaned_content = (content[:start] + content[end:]).strip()
+            if not cleaned_content:
+                cleaned_content = f"Prepared **{spec.title}** for artifact generation."
+            return cleaned_content, spec.model_dump()
+    return content.strip(), None
+
+
+def _hide_incomplete_internal_payloads(content: str) -> str:
+    """Never display a production payload that could not pass its schema."""
+
+    def replace(match: re.Match[str]) -> str:
+        body = match.group("body")
+        lower = body.lower()
+        artifact_shape = '"kind"' in lower and '"sections"' in lower
+        state_shape = '"file"' in lower and '"content"' in lower
+        if not (artifact_shape or state_shape):
+            return match.group(0)
+        return (
+            "> The app withheld an incomplete internal production payload. "
+            "Regenerate this item to create a readable artifact."
+        )
+
+    cleaned = INTERNAL_PAYLOAD_FENCE.sub(replace, content).strip()
+    trailing = _trailing_json_object(cleaned)
+    if trailing:
+        start, end, candidate = trailing
+        lower = json.dumps(candidate).lower()
+        if ('"kind"' in lower and '"sections"' in lower) or (
+            '"file"' in lower and '"content"' in lower
+        ):
+            notice = (
+                "> The app withheld an incomplete internal production payload. "
+                "Regenerate this item to create a readable artifact."
+            )
+            cleaned = (cleaned[:start] + notice + cleaned[end:]).strip()
+    return cleaned
+
+
+INCOMPLETE_INTERNAL_PAYLOAD_NOTICE = (
+    "The app withheld an incomplete internal production payload."
+)
+
+
+def _recover_professor_clarification(content: str, profile: str) -> str:
+    """Turn a rejected model contract into a useful professor-facing next turn."""
+    if INCOMPLETE_INTERNAL_PAYLOAD_NOTICE.lower() not in content.lower():
+        return content
+    if profile == "assessment":
+        return (
+            "I need three teaching details before I draft the quiz:\n\n"
+            "1. Is it for practice and feedback, or will it count toward the grade?\n"
+            "2. What should students demonstrate about the topic?\n"
+            "3. How much time will they have, and what resources may they use?"
+        )
+    return (
+        "I need three teaching details before I plan the lesson:\n\n"
+        "1. What should students be able to do by the end?\n"
+        "2. What do they already know, and where are they likely to struggle?\n"
+        "3. How much time do you have, and what is the class setting?"
+    )
+
+
+def _prepare_professor_display_content(content: str) -> str:
+    """Normalize legacy and current responses before they reach chat or preview."""
+    display = _unwrap_markdown_documents(content)
+    display, _ = _extract_artifact_spec(display)
+    display, _ = _extract_state_file(display)
+    return _hide_incomplete_internal_payloads(display)
+
+
+def _sanitize_professor_decision(
+    content: str, decision: Optional[dict], profile: str
+) -> tuple[str, Optional[dict]]:
+    """Replace internal workflow choices with a consequential teaching choice."""
+    if not decision:
+        return content, decision
+    visible_question_count = content.count("?")
+    normalized_content = re.sub(r"[^a-z0-9]+", " ", content.lower()).strip()
+    normalized_question = re.sub(
+        r"[^a-z0-9]+", " ", decision.get("question", "").lower()
+    ).strip()
+    if (
+        1 <= visible_question_count <= 3
+        and normalized_question
+        and normalized_question in normalized_content
+    ):
+        return content, None
+    generic_decision = decision.get("question", "").strip().lower().startswith(
+        (
+            "select ",
+            "provide ",
+            "choose the information",
+            "what information",
+            "which information",
+            "which details should i confirm",
+        )
+    )
+    if generic_decision and 1 <= visible_question_count <= 3:
+        return content, None
+    if profile != "assessment":
+        return content, decision
+    visible = " ".join(
+        [decision.get("question", "")]
+        + [
+            f"{option.get('label', '')} {option.get('description', '')}"
+            for option in decision.get("options", [])
+        ]
+    ).lower()
+    internal_terms = (
+        "outcome id",
+        "cognitive demand",
+        "assessment blueprint",
+        "metadata",
+        "schema",
+        "skill.md",
+        "markdown",
+        "artifact spec",
+    )
+    if not any(term in visible for term in internal_terms):
+        return content, decision
+    replacement = {
+        "question": "How will students use this quiz?",
+        "options": [
+            {
+                "label": "Practice and feedback (Recommended)",
+                "description": "Create a low-stakes draft that helps reveal misconceptions.",
+                "value": "Make this a formative practice quiz with feedback; it will not count toward the grade.",
+            },
+            {
+                "label": "Counts toward the grade",
+                "description": "Use scoring criteria and require instructor review before release.",
+                "value": "Make this a graded quiz and identify any scoring or policy details I still need to confirm.",
+            },
+        ],
+    }
+    return "One teaching choice will help me draft the quiz appropriately.", replacement
+
+
+def _enforce_professor_question_limit(content: str, profile: str) -> str:
+    """Replace an overlong clarification interview with three teaching questions."""
+    if content.count("?") <= 3:
+        return content
+    lower = content.lower()
+    clarification_markers = (
+        "open question",
+        "clarifying question",
+        "quick questions",
+        "help shape",
+        "need a few details",
+        "to help you",
+        "to help me",
+        "before i draft",
+        "shape the materials",
+        "shape the design",
+        "what should students",
+        "what evidence will",
+        "what constraints shape",
+        "will let me draft",
+    )
+    if not any(marker in lower for marker in clarification_markers):
+        return content
+    if profile == "assessment":
+        return (
+            "I need three teaching details before I draft the quiz:\n\n"
+            "1. Is it for practice and feedback, or will it count toward the grade?\n"
+            "2. What should students demonstrate about the topic?\n"
+            "3. How much time will they have, and what resources may they use?"
+        )
+    return (
+        "I need three teaching details before I plan the lesson:\n\n"
+        "1. What should students be able to do by the end?\n"
+        "2. What do they already know, and where are they likely to struggle?\n"
+        "3. How much time do you have, and what is the class setting?"
+    )
 
 
 def _infer_decision_from_questions(content: str) -> Optional[dict]:
@@ -1046,7 +1746,7 @@ def _artifact_title(content: str, profile: str) -> str:
         "assessment": "Assessment architecture",
         "accessibility": "Accessibility review",
         "course": "Course design plan",
-        "engineering": "Engineering design artifact",
+        "stem": "STEM design artifact",
         "validation": "Validation report",
     }
     return names.get(profile, "Course design response")
@@ -1060,6 +1760,7 @@ def _message_from_row(row: sqlite3.Row) -> dict:
         display_content, extracted_decision = _extract_decision(row["content"])
         if decision is None:
             decision = extracted_decision
+        display_content = _prepare_professor_display_content(display_content)
     if decision and "skill_profile" not in decision:
         decision["skill_profile"] = metadata.get("skill_runtime", {}).get("profile", "auto")
     return {
@@ -1078,13 +1779,14 @@ def _message_from_row(row: sqlite3.Row) -> dict:
 
 def _artifact_from_row(row: sqlite3.Row) -> dict:
     metadata = json.loads(row["metadata_json"] or "{}") if "metadata_json" in row.keys() else {}
+    display_content = _prepare_professor_display_content(row["content"])
     return {
         "id": row["id"],
         "message_id": row["message_id"],
         "title": row["title"],
         "kind": row["kind"],
-        "content": row["content"],
-        "html": _render_markdown(row["content"]),
+        "content": display_content,
+        "html": _render_markdown(display_content),
         "file_format": row["file_format"] if "file_format" in row.keys() else None,
         "has_file": bool(row["file_path"]) if "file_path" in row.keys() else False,
         "tool_trace": metadata.get("tool_trace"),
@@ -1125,7 +1827,7 @@ def _artifact_spec_markdown(spec: dict, project: dict) -> str:
         if section.get("checklist"):
             lines.append("")
         table = section.get("table")
-        if table:
+        if table and any(cell(value) for value in table.get("headers", [])):
             headers = [cell(value) for value in table["headers"]]
             lines.extend(
                 [
@@ -1293,6 +1995,7 @@ def _get_project_workspace(settings: Settings, project_id: str) -> dict:
         "messages": [_message_from_row(row) for row in message_rows],
         "artifacts": [_artifact_from_row(row) for row in artifact_rows],
         "sources": _list_project_sources(settings, project_id),
+        "state_files": _list_state_files(settings, project_id),
     }
 
 
@@ -1395,9 +2098,11 @@ def _persist_exchange(
     now = _utc_now()
     user_id = f"MSG-{uuid4().hex[:16].upper()}"
     assistant_id = f"MSG-{uuid4().hex[:16].upper()}"
-    create_artifact = not metadata.get("decision") and profile in {
-        "artifact", "assessment", "accessibility", "course", "engineering", "validation"
-    }
+    create_artifact = not metadata.get("decision") and (
+        bool(metadata.get("artifact_spec"))
+        or profile
+        in {"artifact", "assessment", "accessibility", "course", "stem", "validation"}
+    )
     artifact_id = f"ART-{uuid4().hex[:16].upper()}" if create_artifact else None
     with _database_connection(settings) as connection:
         connection.execute(
@@ -1587,6 +2292,102 @@ async def skill_status(profile: str = "establish") -> dict:
     settings = get_settings()
     _, skill_runtime = _load_skill_runtime(settings, profile)
     return skill_runtime
+
+
+@app.get("/api/skill/assets")
+async def list_skill_assets() -> dict:
+    """Expose the skill's state-file templates so the UI can start a file from one."""
+    settings = get_settings()
+    assets_dir = settings.skill_dir / "assets"
+    assets = []
+    for filename in sorted(STATE_FILE_VALIDATORS):
+        path = assets_dir / filename
+        if path.is_file():
+            assets.append(
+                {
+                    "file": filename,
+                    "validator": STATE_FILE_VALIDATORS[filename],
+                    "bytes": path.stat().st_size,
+                }
+            )
+    return {"assets": assets, "profiles": list(DESIGN_PROFILES)}
+
+
+@app.get("/api/skill/assets/{filename}")
+async def read_skill_asset(filename: str) -> dict:
+    settings = get_settings()
+    if filename not in STATE_FILE_VALIDATORS:
+        raise HTTPException(status_code=404, detail="Unknown skill asset")
+    path = settings.skill_dir / "assets" / filename
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail=f"Asset not installed: {filename}")
+    return {
+        "file": filename,
+        "content": path.read_text(encoding="utf-8"),
+        "validator": STATE_FILE_VALIDATORS[filename],
+    }
+
+
+@app.get("/api/projects/{project_id}/state")
+async def list_project_state(project_id: str) -> dict:
+    settings = get_settings()
+    _validate_project_id(project_id)
+    return {
+        "project_id": project_id,
+        "state_files": _list_state_files(settings, project_id),
+        "known_files": sorted(STATE_FILE_VALIDATORS),
+    }
+
+
+@app.get("/api/projects/{project_id}/state/{filename}")
+async def read_project_state(project_id: str, filename: str) -> dict:
+    settings = get_settings()
+    _validate_project_id(project_id)
+    path = _state_file_path(settings, project_id, filename)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail=f"No {filename} in this project")
+    return {"file": filename, "content": path.read_text(encoding="utf-8")}
+
+
+@app.put("/api/projects/{project_id}/state/{filename}")
+async def write_project_state(
+    project_id: str, filename: str, request: StateFileWrite
+) -> dict:
+    settings = get_settings()
+    _validate_project_id(project_id)
+    _ensure_project(settings, project_id)
+    if request.file != filename:
+        raise HTTPException(status_code=400, detail="File name mismatch")
+    written = await anyio.to_thread.run_sync(
+        _write_state_file, settings, project_id, filename, request.content
+    )
+    validation = await anyio.to_thread.run_sync(
+        _validate_state_file, settings, project_id, filename, request.design_profile
+    )
+    return {"state_file": {**written, "validation": validation}}
+
+
+@app.delete("/api/projects/{project_id}/state/{filename}")
+async def delete_project_state(project_id: str, filename: str) -> dict:
+    settings = get_settings()
+    _validate_project_id(project_id)
+    path = _state_file_path(settings, project_id, filename)
+    if not path.is_file():
+        raise HTTPException(status_code=404, detail=f"No {filename} in this project")
+    path.unlink()
+    return {"deleted": filename}
+
+
+@app.post("/api/projects/{project_id}/validate")
+async def validate_project_state(
+    project_id: str, design_profile: str = "establish"
+) -> dict:
+    """Run the skill's own validators over this project's portable state."""
+    settings = get_settings()
+    _validate_project_id(project_id)
+    return await anyio.to_thread.run_sync(
+        _validate_project_state, settings, project_id, design_profile
+    )
 
 
 @app.get("/api/projects")
@@ -2072,7 +2873,7 @@ async def chat(request: ChatRequest):
     selected_profile = (
         _infer_skill_profile(request.messages)
         if request.skill_profile == "auto"
-        else request.skill_profile
+        else SKILL_PROFILE_ALIASES.get(request.skill_profile, request.skill_profile)
     )
     skill_prompt, skill_runtime = _load_skill_runtime(settings, selected_profile)
     latest_user_message = next(
@@ -2086,7 +2887,7 @@ async def chat(request: ChatRequest):
     if not latest_user_message:
         raise HTTPException(status_code=400, detail="A user message is required")
 
-    project_mode = "Studio"
+    project_mode = "Co-design"
     conversation_messages = [
         message.model_dump()
         for message in request.messages
@@ -2198,18 +2999,64 @@ async def chat(request: ChatRequest):
     final_text = re.sub(r"<think>.*?</think>", "", final_text, flags=re.DOTALL).strip()
 
     final_text, decision = _extract_decision(final_text)
+    if project_mode == "Co-design":
+        final_text, decision = _sanitize_professor_decision(
+            final_text, decision, selected_profile
+        )
     auto_decision = None
     if project_mode == "Auto" and decision:
         final_text, decision, auto_decision = _apply_auto_decision(final_text, decision)
     if decision:
         decision["skill_profile"] = selected_profile
     artifact_spec = None
+    state_file_spec = None
     if decision is None:
         final_text, artifact_spec = _extract_artifact_spec(final_text)
+        final_text, state_file_spec = _extract_state_file(final_text)
+        final_text = _unwrap_markdown_documents(final_text)
+        final_text = _hide_incomplete_internal_payloads(final_text)
+        if project_mode == "Co-design":
+            final_text = _recover_professor_clarification(
+                final_text, selected_profile
+            )
+        if (
+            project_mode == "Co-design"
+            and artifact_spec is None
+            and state_file_spec is None
+        ):
+            final_text = _enforce_professor_question_limit(
+                final_text, selected_profile
+            )
+    # Generation and validation stay separate: the model writes the state file, the
+    # skill's own validator judges it, and both results are recorded on the message.
+    state_file_result = None
+    if state_file_spec and request.project_id:
+        try:
+            written = await anyio.to_thread.run_sync(
+                _write_state_file,
+                settings,
+                request.project_id,
+                state_file_spec["file"],
+                state_file_spec["content"],
+            )
+            validation = await anyio.to_thread.run_sync(
+                _validate_state_file,
+                settings,
+                request.project_id,
+                state_file_spec["file"],
+                state_file_spec["design_profile"],
+            )
+            state_file_result = {**written, "validation": validation}
+        except (OSError, HTTPException) as exc:
+            state_file_result = {
+                "file": state_file_spec["file"],
+                "error": getattr(exc, "detail", str(exc)),
+            }
     metadata = {
         "decision": decision,
         "auto_decision": auto_decision,
         "artifact_spec": artifact_spec,
+        "state_file": state_file_result,
         "skill_runtime": skill_runtime,
         "sources_used": sources_used,
         "model": upstream_content.get("model", model_id),
@@ -2253,6 +3100,7 @@ async def chat(request: ChatRequest):
         "assistant_message": persisted_assistant,
         "artifact": artifact,
         "artifact_tool_error": artifact_tool_error,
+        "state_file": state_file_result,
     }
 
 

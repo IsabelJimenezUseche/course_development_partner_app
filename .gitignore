@@ -1,4 +1,7 @@
 .venv*
 .env*
+data/
+evaluations/results/
+validation/results/
 !.env.example
 __pycache__/

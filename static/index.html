@@ -5,7 +5,7 @@
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <meta name="description" content="A persistent, source-grounded course design workspace powered by Purdue GenAI." />
     <title>Course Development Partner</title>
-    <link rel="stylesheet" href="/static/styles.css?v=20260801-22" />
+    <link rel="stylesheet" href="/static/styles.css?v=20260803-23" />
   </head>
   <body>
     <div class="app-shell">
@@ -25,6 +25,9 @@
         <div class="topbar-actions">
           <button class="topbar-button artifacts-button" id="artifactsButton" type="button" aria-haspopup="dialog" aria-label="Artifacts">
             <span class="button-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M3 6.5h6l2 2h10v10.5H3z"/><path d="M3 6.5V5h7l2 2h9v1.5"/></svg></span><span class="button-label">Artifacts</span><span class="count-badge" id="artifactCount">0</span>
+          </button>
+          <button class="topbar-button state-button" id="stateButton" type="button" aria-haspopup="dialog" aria-label="Design state">
+            <span class="button-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><path d="M9 11l2 2 4-4"/><path d="M4 4h16v16H4z"/></svg></span><span class="button-label">Design state</span><span class="count-badge" id="stateCount">0</span>
           </button>
           <button class="topbar-button" id="settingsButton" type="button" aria-haspopup="dialog" aria-label="Settings"><span class="button-icon" aria-hidden="true"><svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M12 2v3M12 19v3M4.93 4.93l2.12 2.12M16.95 16.95l2.12 2.12M2 12h3M19 12h3M4.93 19.07l2.12-2.12M16.95 7.05l2.12-2.12"/></svg></span><span class="button-label">Settings</span></button>
           <div class="model-status" id="modelStatus" role="status" aria-live="polite" aria-label="Model status: Checking model" data-tooltip="Checking model…" tabindex="0">
@@ -67,7 +70,7 @@
             <fieldset class="mode-fieldset">
               <legend>Collaboration mode</legend>
               <div class="mode-options">
-                <label><input type="radio" name="mode" value="Studio" checked /><span><strong>Studio</strong><small>One decision at a time</small></span></label>
+                <label><input type="radio" name="mode" value="Co-design" checked /><span><strong>Co-design</strong><small>One decision at a time</small></span></label>
                 <label><input type="radio" name="mode" value="Guided" /><span><strong>Guided</strong><small>Review each phase</small></span></label>
                 <label><input type="radio" name="mode" value="Rapid" /><span><strong>Rapid</strong><small>Draft with assumptions</small></span></label>
                 <label><input type="radio" name="mode" value="Auto" /><span><strong>Auto</strong><small>Choose and complete</small></span></label>
@@ -137,6 +140,24 @@
       <div class="artifact-list" id="artifactList"></div>
     </dialog>
 
+    <dialog class="modal state-modal" id="stateDialog" aria-labelledby="stateDialogTitle">
+      <div class="modal-header"><div><p class="eyebrow">Portable project state</p><h2 id="stateDialogTitle">Design state</h2></div><button class="close-button" data-close="stateDialog" type="button" aria-label="Close design state">×</button></div>
+      <p class="state-intro">State files live beside the project and are checked by the skill's own validators in <code>scripts/</code>. Structural checks only — passing does not replace educational, accessibility, or release review.</p>
+      <div class="state-toolbar">
+        <label class="field state-profile"><span>Design profile</span><select id="stateProfile"><option value="establish">establish</option><option value="produce">produce</option><option value="handoff">handoff</option></select></label>
+        <button class="secondary-button" id="runValidatorsButton" type="button">Run validators</button>
+      </div>
+      <div class="state-list" id="stateList"></div>
+      <div class="validation-results" id="validationResults" aria-live="polite"></div>
+      <label class="field"><span>Start a state file from its skill template</span>
+        <select id="stateTemplatePicker"><option value="">Choose a template…</option></select>
+      </label>
+      <form id="stateEditorForm" hidden>
+        <label class="field"><span id="stateEditorLabel">Edit state file</span><textarea id="stateEditorContent" rows="14" spellcheck="false"></textarea></label>
+        <div class="modal-actions"><button class="secondary-button" id="stateEditorCancel" type="button">Cancel</button><button class="primary-button" type="submit">Save and validate</button></div>
+      </form>
+    </dialog>
+
     <dialog class="modal artifact-tool-modal" id="artifactToolDialog" aria-labelledby="artifactToolDialogTitle">
       <div class="modal-header"><div><p class="eyebrow">Local artifact tool</p><h2 id="artifactToolDialogTitle">Create a teaching file</h2></div><button class="close-button" data-close="artifactToolDialog" type="button" aria-label="Close teaching file creator">×</button></div>
       <form id="artifactToolForm">
@@ -192,6 +213,6 @@
       </form>
     </dialog>
 
-    <script src="/static/app.js?v=20260801-22" defer></script>
+    <script src="/static/app.js?v=20260803-23" defer></script>
   </body>
 </html>
