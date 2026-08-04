@@ -379,27 +379,3 @@ input:focus, select:focus, textarea:focus { border-color: var(--gold-dark); box-
   .trace-summary { grid-template-columns: repeat(2, minmax(0, 1fr)); }.trace-event { grid-template-columns: 34px minmax(0, 1fr); gap: 10px; }.trace-marker { width: 34px; height: 34px; }.trace-timeline::before { left: 16px; }.trace-event-header { display: grid; }.trace-detail { grid-template-columns: 1fr; gap: 2px; }
   .site-footer { align-items: center; flex-direction: column; gap: 2px; }.site-footer > span[aria-hidden] { display: none; }
 }
-
-/* Portable design state and skill validator results */
-.state-intro { margin: 0 0 14px; color: var(--muted); font-size: .8rem; line-height: 1.5; }
-.state-intro code { padding: 1px 5px; border-radius: 5px; background: var(--panel); font-size: .76rem; }
-.state-toolbar { display: flex; align-items: flex-end; justify-content: space-between; gap: 14px; margin-bottom: 14px; }
-.state-profile { max-width: 200px; }
-.state-list { display: grid; gap: 9px; }
-.state-row { display: grid; grid-template-columns: minmax(0,1fr) auto; gap: 14px; align-items: center; padding: 12px 14px; border: 1px solid var(--soft-line); border-radius: 12px; background: #fff; }
-.state-row strong { display: block; font-size: .84rem; }
-.state-row small { display: block; margin-top: 4px; color: var(--muted); font-size: .74rem; }
-.empty-note { margin: 10px 0 0; color: var(--muted); font-size: .78rem; line-height: 1.5; }
-.validation-results { display: grid; gap: 10px; margin: 18px 0; }
-.validation-summary { margin: 0; padding: 10px 13px; border-left: 4px solid var(--line); border-radius: 8px; background: var(--panel); font-size: .8rem; font-weight: 700; }
-.validation-summary.pass { border-left-color: var(--success); }
-.validation-summary.fail { border-left-color: var(--danger); }
-.validation-summary.incomplete { border-left-color: var(--rush); }
-.validation-check { padding: 10px 13px; border: 1px solid var(--soft-line); border-radius: 10px; background: #fff; }
-.validation-check summary { cursor: pointer; font-size: .79rem; font-weight: 700; }
-.validation-check ul { margin: 9px 0 0; padding-left: 18px; display: grid; gap: 5px; }
-.finding { font-size: .76rem; line-height: 1.45; }
-.finding.error { color: var(--danger); }
-.finding.gap, .finding.issue, .finding.incomplete { color: var(--gold-dark); }
-.finding.ok { color: var(--success); }
-#stateEditorContent { width: 100%; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: .76rem; line-height: 1.5; }

@@ -15,11 +15,6 @@ const elements = {
   decisionOptions: $("#decisionOptions"), customDecisionButton: $("#customDecisionButton"),
   artifactsButton: $("#artifactsButton"), artifactCount: $("#artifactCount"),
   artifactsDialog: $("#artifactsDialog"), artifactList: $("#artifactList"),
-  stateButton: $("#stateButton"), stateCount: $("#stateCount"), stateDialog: $("#stateDialog"),
-  stateList: $("#stateList"), stateProfile: $("#stateProfile"), runValidatorsButton: $("#runValidatorsButton"),
-  validationResults: $("#validationResults"), stateTemplatePicker: $("#stateTemplatePicker"),
-  stateEditorForm: $("#stateEditorForm"), stateEditorLabel: $("#stateEditorLabel"),
-  stateEditorContent: $("#stateEditorContent"), stateEditorCancel: $("#stateEditorCancel"),
   artifactToolButton: $("#artifactToolButton"), artifactToolDialog: $("#artifactToolDialog"),
   artifactToolForm: $("#artifactToolForm"), artifactToolKind: $("#artifactToolKind"),
   artifactToolTitle: $("#artifactToolTitle"), artifactToolSubtitle: $("#artifactToolSubtitle"),
@@ -63,9 +58,6 @@ const state = {
   saveTimer: null,
   pendingDecision: null,
   artifactToolNotice: null,
-  stateFiles: [],
-  stateAssets: [],
-  editingStateFile: null,
 };
 
 function openDialog(dialog) {
@@ -362,153 +354,6 @@ async function previewSource(source) {
   }
 }
 
-const VALIDATION_LABELS = { pass: "Passed", fail: "Errors", incomplete: "Gaps", timeout: "Timed out", error: "Tool error", unavailable: "No validator", empty: "No state yet" };
-
-function renderStateFiles() {
-  elements.stateCount.textContent = String(state.stateFiles.length);
-  elements.stateList.replaceChildren();
-  if (!state.stateFiles.length) {
-    const empty = document.createElement("p");
-    empty.className = "empty-note";
-    empty.textContent = "No portable state files yet. The design partner creates them as the work progresses, or start one from a template below.";
-    elements.stateList.append(empty);
-    return;
-  }
-  state.stateFiles.forEach((file) => {
-    const row = document.createElement("div");
-    row.className = "state-row";
-    const label = document.createElement("div");
-    const name = document.createElement("strong");
-    name.textContent = file.file;
-    const meta = document.createElement("small");
-    meta.textContent = `${formatBytes(file.bytes)} · updated ${formatDate(file.updated_at)}${file.has_validator ? "" : " · no dedicated validator"}`;
-    label.append(name, meta);
-    const edit = document.createElement("button");
-    edit.type = "button";
-    edit.className = "secondary-button";
-    edit.textContent = "Edit";
-    edit.addEventListener("click", () => openStateEditor(file.file));
-    row.append(label, edit);
-    elements.stateList.append(row);
-  });
-}
-
-function renderValidationResults(report) {
-  elements.validationResults.replaceChildren();
-  if (!report) return;
-  const header = document.createElement("p");
-  header.className = `validation-summary ${report.status}`;
-  header.textContent = `${VALIDATION_LABELS[report.status] || report.status} · ${report.checks.length} validator${report.checks.length === 1 ? "" : "s"} · profile ${report.design_profile}`;
-  elements.validationResults.append(header);
-  report.checks.forEach((check) => {
-    const block = document.createElement("details");
-    block.className = `validation-check ${check.status}`;
-    if (check.status !== "pass") block.open = true;
-    const summary = document.createElement("summary");
-    summary.textContent = `${check.script} — ${VALIDATION_LABELS[check.status] || check.status}`;
-    block.append(summary);
-    const list = document.createElement("ul");
-    check.findings.forEach((finding) => {
-      const item = document.createElement("li");
-      item.className = `finding ${finding.level}`;
-      item.textContent = `${finding.level}: ${finding.message}`;
-      list.append(item);
-    });
-    block.append(list);
-    elements.validationResults.append(block);
-  });
-  const note = document.createElement("p");
-  note.className = "empty-note";
-  note.textContent = report.scope_note || "";
-  elements.validationResults.append(note);
-}
-
-async function refreshStateFiles() {
-  if (!state.projectId) return;
-  const response = await fetch(`/api/projects/${encodeURIComponent(state.projectId)}/state`);
-  if (!response.ok) return;
-  const result = await response.json();
-  state.stateFiles = result.state_files || [];
-  renderStateFiles();
-}
-
-async function loadStateTemplates() {
-  const response = await fetch("/api/skill/assets");
-  if (!response.ok) return;
-  const result = await response.json();
-  state.stateAssets = result.assets || [];
-  elements.stateTemplatePicker.replaceChildren();
-  const placeholder = document.createElement("option");
-  placeholder.value = "";
-  placeholder.textContent = "Choose a template…";
-  elements.stateTemplatePicker.append(placeholder);
-  state.stateAssets.forEach((asset) => {
-    const option = document.createElement("option");
-    option.value = asset.file;
-    option.textContent = asset.validator ? `${asset.file} (validated)` : asset.file;
-    elements.stateTemplatePicker.append(option);
-  });
-}
-
-async function openStateEditor(filename, seedFromTemplate = false) {
-  const url = seedFromTemplate
-    ? `/api/skill/assets/${encodeURIComponent(filename)}`
-    : `/api/projects/${encodeURIComponent(state.projectId)}/state/${encodeURIComponent(filename)}`;
-  const response = await fetch(url);
-  if (!response.ok) return;
-  const result = await response.json();
-  state.editingStateFile = filename;
-  elements.stateEditorLabel.textContent = `${filename}${seedFromTemplate ? " (from skill template)" : ""}`;
-  elements.stateEditorContent.value = result.content || "";
-  elements.stateEditorForm.hidden = false;
-  elements.stateEditorContent.focus();
-}
-
-function closeStateEditor() {
-  state.editingStateFile = null;
-  elements.stateEditorForm.hidden = true;
-  elements.stateEditorContent.value = "";
-  elements.stateTemplatePicker.value = "";
-}
-
-async function saveStateFile(event) {
-  event.preventDefault();
-  if (!state.editingStateFile || !state.projectId) return;
-  const filename = state.editingStateFile;
-  const response = await fetch(`/api/projects/${encodeURIComponent(state.projectId)}/state/${encodeURIComponent(filename)}`, {
-    method: "PUT",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ file: filename, content: elements.stateEditorContent.value, design_profile: elements.stateProfile.value }),
-  });
-  if (!response.ok) {
-    const error = await response.json().catch(() => ({ detail: "Could not save state file" }));
-    elements.validationResults.textContent = error.detail;
-    return;
-  }
-  const result = await response.json();
-  closeStateEditor();
-  await refreshStateFiles();
-  if (result.state_file?.validation) {
-    renderValidationResults({ status: result.state_file.validation.status, design_profile: elements.stateProfile.value, checks: [result.state_file.validation], scope_note: "Structural check for this file only." });
-  }
-}
-
-async function runValidators() {
-  if (!state.projectId) return;
-  elements.runValidatorsButton.disabled = true;
-  elements.validationResults.textContent = "Running the skill's validators…";
-  try {
-    const response = await fetch(`/api/projects/${encodeURIComponent(state.projectId)}/validate?design_profile=${encodeURIComponent(elements.stateProfile.value)}`, { method: "POST" });
-    const result = await response.json();
-    if (!response.ok) throw new Error(result.detail || "Validation failed");
-    renderValidationResults(result);
-  } catch (error) {
-    elements.validationResults.textContent = error.message;
-  } finally {
-    elements.runValidatorsButton.disabled = false;
-  }
-}
-
 function renderArtifacts() {
   elements.artifactCount.textContent = String(state.artifacts.length);
   elements.artifactList.replaceChildren();
@@ -694,11 +539,11 @@ async function loadProject(projectId) {
   const response = await fetch(`/api/projects/${encodeURIComponent(projectId)}`);
   const workspace = await response.json();
   if (!response.ok) throw new Error(workspace.detail || "Could not load project");
-  state.projectId = projectId; state.project = workspace.project; state.messages = workspace.messages || []; state.artifacts = workspace.artifacts || []; state.sources = workspace.sources || []; state.stateFiles = workspace.state_files || [];
+  state.projectId = projectId; state.project = workspace.project; state.messages = workspace.messages || []; state.artifacts = workspace.artifacts || []; state.sources = workspace.sources || [];
   localStorage.setItem("courseDesignProjectId", projectId);
   state.pendingDecision = null;
   elements.messageInput.placeholder = "Add a direction, question, or correction…";
-  fillProjectForm(state.project); renderSources(); renderArtifacts(); renderStateFiles(); renderConversation(); updateExportLinks(); renderProjectList(); setSaveStatus("Saved locally");
+  fillProjectForm(state.project); renderSources(); renderArtifacts(); renderConversation(); updateExportLinks(); renderProjectList(); setSaveStatus("Saved locally");
   if (window.matchMedia("(max-width: 820px)").matches) setMobileBriefOpen(!state.messages.length && !state.project.outcome);
   else setMobileBriefOpen(false);
 }
@@ -966,7 +811,6 @@ async function requestDesignPartner(userText, displayText, skillProfile = "auto"
     createMessage(persistedUser);
     createMessage(assistant, { artifact: result.artifact }); renderArtifacts();
     if (result.artifact_tool_error) state.artifactToolNotice = `The response was saved, but the Office file was not created: ${result.artifact_tool_error}`;
-    if (result.state_file) await refreshStateFiles();
     if (result.skill_runtime) { state.skillRuntime = result.skill_runtime; elements.skillRuntimeLabel.textContent = `Skill active · ${result.skill_runtime.profile} · gpt-oss checks on · ${result.skill_runtime.fingerprint}`; }
     elements.emptyState.classList.add("compact"); state.started = true; elements.sessionLabel.textContent = `${state.project.mode} project · ${state.messages.length} saved messages`; await refreshProjects();
     if (result.decision && state.project?.mode !== "Auto") showDecision(result.decision, assistant.id);
@@ -1022,16 +866,6 @@ elements.newProjectButton.addEventListener("click", createProject);
 elements.artifactsButton.addEventListener("click", () => { renderArtifacts(); openDialog(elements.artifactsDialog); });
 elements.artifactToolButton.addEventListener("click", () => { closeDialog(elements.artifactsDialog); elements.artifactToolStatus.textContent = ""; openDialog(elements.artifactToolDialog); elements.artifactToolTitle.focus(); });
 elements.artifactToolForm.addEventListener("submit", generateTeachingFile);
-elements.stateButton.addEventListener("click", async () => {
-  elements.validationResults.replaceChildren();
-  closeStateEditor();
-  await Promise.all([refreshStateFiles(), loadStateTemplates()]);
-  openDialog(elements.stateDialog);
-});
-elements.runValidatorsButton.addEventListener("click", runValidators);
-elements.stateTemplatePicker.addEventListener("change", (event) => { if (event.target.value) openStateEditor(event.target.value, true); });
-elements.stateEditorCancel.addEventListener("click", closeStateEditor);
-elements.stateEditorForm.addEventListener("submit", saveStateFile);
 elements.traceButton.addEventListener("click", openSkillTrace);
 elements.exportButton.addEventListener("click", openFullExport);
 elements.settingsButton.addEventListener("click", async () => {

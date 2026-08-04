@@ -298,6 +298,81 @@ def test_skill_validator_reports_findings_from_an_invalid_fixture(monkeypatch, t
     assert {finding["level"] for finding in findings} & {"error", "gap"}
 
 
+def test_skill_tools_are_offered_to_the_model():
+    names = {tool["function"]["name"] for tool in server.skill_tool_definitions()}
+
+    assert names == {
+        "read_skill_template",
+        "list_state_files",
+        "read_state_file",
+        "write_state_file",
+        "run_validators",
+    }
+    # The model must not be able to name a file the write allow-list would refuse.
+    write = next(
+        tool for tool in server.skill_tool_definitions()
+        if tool["function"]["name"] == "write_state_file"
+    )
+    assert set(write["function"]["parameters"]["properties"]["file"]["enum"]) == set(
+        STATE_FILE_VALIDATORS
+    )
+
+
+def test_write_state_file_tool_returns_validator_findings(monkeypatch, tmp_path):
+    """The agent has to see why a write failed, or it cannot correct itself."""
+    monkeypatch.setenv("APP_DATA_DIR", str(tmp_path))
+    settings = get_settings()
+
+    result = server._dispatch_skill_tool(
+        settings,
+        "project-tooldispatch1",
+        "write_state_file",
+        {"file": "alignment-map.md", "content": _skill_fixture("alignment", "invalid.md")},
+    )
+
+    assert result["validation"]["status"] in {"fail", "incomplete"}
+    assert result["validation"]["findings"], "findings must reach the model"
+
+    good = server._dispatch_skill_tool(
+        settings,
+        "project-tooldispatch1",
+        "write_state_file",
+        {"file": "alignment-map.md", "content": _skill_fixture("alignment", "valid.md")},
+    )
+    assert good["validation"]["status"] == "pass"
+
+
+def test_skill_tools_refuse_unknown_files_and_missing_projects(monkeypatch, tmp_path):
+    monkeypatch.setenv("APP_DATA_DIR", str(tmp_path))
+    settings = get_settings()
+
+    escaped = server._dispatch_skill_tool(
+        settings, "project-tooldispatch2", "write_state_file",
+        {"file": "../../escaped.md", "content": "x"},
+    )
+    assert "error" in escaped
+    assert not (tmp_path / "escaped.md").exists()
+
+    no_project = server._dispatch_skill_tool(
+        settings, None, "run_validators", {"design_profile": "establish"}
+    )
+    assert "error" in no_project
+
+    unknown = server._dispatch_skill_tool(
+        settings, "project-tooldispatch2", "not_a_tool", {}
+    )
+    assert "error" in unknown
+
+
+def test_read_skill_template_tool_serves_the_installed_asset():
+    result = server._dispatch_skill_tool(
+        get_settings(), None, "read_skill_template", {"file": "alignment-map.md"}
+    )
+
+    assert result["validator"] == "validate_alignment_map.py"
+    assert "Cognitive demand" in result["template"]
+
+
 def test_state_file_round_trip_through_the_api(monkeypatch, tmp_path):
     monkeypatch.setenv("APP_DATA_DIR", str(tmp_path))
     project_id = "project-state-api01"

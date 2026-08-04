@@ -316,6 +316,10 @@ STATE_FILE_VALIDATORS = {
 PROJECT_VALIDATOR = "validate_project.py"
 DESIGN_PROFILES = ("establish", "produce", "handoff")
 VALIDATOR_TIMEOUT_SECONDS = 30
+# How many times the model may call tools before it must answer. Enough for
+# write -> validate -> read findings -> rewrite -> validate on a couple of files.
+MAX_TOOL_ITERATIONS = 6
+MAX_TOOL_RESULT_CHARS = 20_000
 # Shared exit-code convention across every scripts/validate_*.py in the skill.
 VALIDATOR_EXIT_STATUS = {0: "pass", 1: "fail", 2: "incomplete"}
 # Prefixes the skill's validators use on stdout. Anything else is treated as prose.
@@ -364,8 +368,23 @@ STRUCTURED_DECISION_CONTRACT = (
     "Provide two or three mutually exclusive options. Put the recommended option first and "
     "include '(Recommended)' in its label. Do not emit this block when a choice is not needed."
 )
+SKILL_TOOL_CONTRACT = (
+    "You have working tools for the skill's portable state. Prefer them over describing "
+    "what you would do:\n"
+    "- `read_skill_template` before writing a state file for the first time;\n"
+    "- `write_state_file` to save it, which runs the file's validator and returns the "
+    "findings;\n"
+    "- `run_validators` for the whole-project cross-file check.\n"
+    "Treat a validator result as work to finish, not as a report to hand over. If a write "
+    "comes back `fail` or `incomplete`, read the findings, correct that exact problem, and "
+    "call `write_state_file` again before replying. Common corrections: use plain ASCII "
+    "hyphens in column headings rather than look-alike dashes; write identifiers as `M-1` "
+    "or `LO-1` with a hyphen; separate multiple identifiers with semicolons, never commas; "
+    "and answer every template field rather than leaving one blank. When you reply to the "
+    "educator, describe the teaching decisions in plain language, not the tool mechanics."
+)
 STATE_FILE_CONTRACT = (
-    "When the workflow calls for creating or updating a portable state file, include "
+    "If tools are unavailable, fall back to including "
     "exactly one fenced `state_file` JSON block at the end. Use this schema: "
     '{"file":"alignment-map.md","content":"<complete Markdown file>"}. '
     "Allowed file names: " + ", ".join(sorted(STATE_FILE_VALIDATORS)) + ". "
@@ -505,6 +524,8 @@ def _load_skill_runtime(settings: Settings, profile: str) -> tuple[str, dict]:
     digest.update(ARTIFACT_TOOL_CONTRACT.encode("utf-8"))
     digest.update(b"state-file-contract")
     digest.update(STATE_FILE_CONTRACT.encode("utf-8"))
+    digest.update(b"skill-tool-contract")
+    digest.update(SKILL_TOOL_CONTRACT.encode("utf-8"))
 
     prompt = (
         "Use the following locally installed Course Development Partner Agent Skill as "
@@ -519,6 +540,8 @@ def _load_skill_runtime(settings: Settings, profile: str) -> tuple[str, dict]:
         + STRUCTURED_DECISION_CONTRACT
         + "\n\n"
         + ARTIFACT_TOOL_CONTRACT
+        + "\n\n"
+        + SKILL_TOOL_CONTRACT
         + "\n\n"
         + STATE_FILE_CONTRACT
         + "\n\n"
@@ -812,6 +835,176 @@ def _validate_project_state(
             "not replace educational, accessibility, or release review."
         ),
     }
+
+
+def skill_tool_definitions() -> list[dict]:
+    """OpenAI-style tool schemas exposing the skill's assets and validators.
+
+    The point is that the model works the way any tool-using agent does: fetch the
+    template, write the file, run the validator, read the findings, fix, re-run. A
+    single-shot completion cannot see that a column heading used a non-breaking
+    hyphen; an agent that runs the validator can.
+    """
+    state_files = sorted(STATE_FILE_VALIDATORS)
+    return [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_skill_template",
+                "description": (
+                    "Read the skill's blank template for a portable state file. Call this "
+                    "before writing a state file for the first time so the headings, "
+                    "table columns, and schema-version line are exactly right."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file": {"type": "string", "enum": state_files},
+                    },
+                    "required": ["file"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "list_state_files",
+                "description": "List the portable state files this project already holds.",
+                "parameters": {"type": "object", "properties": {}},
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "read_state_file",
+                "description": "Read the current contents of one portable state file.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {"file": {"type": "string", "enum": state_files}},
+                    "required": ["file"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "write_state_file",
+                "description": (
+                    "Write a portable state file and immediately run its validator. "
+                    "Returns the validator status and findings. If the status is not "
+                    "'pass', fix the reported problems and call this again."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file": {"type": "string", "enum": state_files},
+                        "content": {
+                            "type": "string",
+                            "description": "The complete Markdown file, not a fragment.",
+                        },
+                        "design_profile": {"type": "string", "enum": list(DESIGN_PROFILES)},
+                    },
+                    "required": ["file", "content"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "run_validators",
+                "description": (
+                    "Run every applicable skill validator over the project's portable "
+                    "state, including the cross-file project check."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "design_profile": {"type": "string", "enum": list(DESIGN_PROFILES)},
+                    },
+                },
+            },
+        },
+    ]
+
+
+def _summarize_tool_trace(tool_trace: list[dict]) -> str:
+    """Professor-facing sentence for a turn that ended in tool calls without prose."""
+    written = [
+        entry for entry in tool_trace if entry["tool"] == "write_state_file"
+    ]
+    if not written:
+        return "Reviewed the project's design state."
+    lines = ["Updated the project's design state:", ""]
+    for entry in written:
+        filename = entry["arguments"].get("file", "a state file")
+        status = entry.get("status") or "written"
+        verdict = {
+            "pass": "checks passed",
+            "fail": "still has errors to fix",
+            "incomplete": "has gaps still to fill",
+        }.get(status, status)
+        lines.append(f"- `{filename}` — {verdict}")
+    return "\n".join(lines)
+
+
+def _dispatch_skill_tool(
+    settings: Settings, project_id: Optional[str], name: str, arguments: dict
+) -> dict:
+    """Execute one model-requested tool call locally and return a JSON-able result."""
+    if name == "read_skill_template":
+        filename = arguments.get("file", "")
+        if filename not in STATE_FILE_VALIDATORS:
+            return {"error": f"Unknown state file: {filename}"}
+        path = settings.skill_dir / "assets" / filename
+        if not path.is_file():
+            return {"error": f"Template not installed: assets/{filename}"}
+        return {
+            "file": filename,
+            "template": path.read_text(encoding="utf-8"),
+            "validator": STATE_FILE_VALIDATORS[filename],
+        }
+
+    # Everything below needs somewhere to put the file.
+    if not project_id:
+        return {"error": "No project is open, so state files cannot be read or written."}
+
+    if name == "list_state_files":
+        return {"state_files": _list_state_files(settings, project_id)}
+
+    if name == "read_state_file":
+        filename = arguments.get("file", "")
+        if filename not in STATE_FILE_VALIDATORS:
+            return {"error": f"Unknown state file: {filename}"}
+        path = _state_file_path(settings, project_id, filename)
+        if not path.is_file():
+            return {"error": f"{filename} does not exist yet in this project."}
+        return {"file": filename, "content": path.read_text(encoding="utf-8")}
+
+    if name == "write_state_file":
+        filename = arguments.get("file", "")
+        content = arguments.get("content", "")
+        profile = arguments.get("design_profile") or "establish"
+        if filename not in STATE_FILE_VALIDATORS:
+            return {"error": f"Unknown state file: {filename}"}
+        if not isinstance(content, str) or not content.strip():
+            return {"error": "content must be the complete Markdown file"}
+        if profile not in DESIGN_PROFILES:
+            profile = "establish"
+        written = _write_state_file(settings, project_id, filename, content)
+        validation = _validate_state_file(settings, project_id, filename, profile)
+        return {
+            "written": written,
+            "validation": validation
+            or {"status": "unavailable", "note": "No validator ships for this file."},
+        }
+
+    if name == "run_validators":
+        profile = arguments.get("design_profile") or "establish"
+        if profile not in DESIGN_PROFILES:
+            profile = "establish"
+        return _validate_project_state(settings, project_id, profile)
+
+    return {"error": f"Unknown tool: {name}"}
 
 
 def _source_dir(settings: Settings, project_id: str, source_id: str) -> Path:
@@ -2944,49 +3137,118 @@ async def chat(request: ChatRequest):
                 {"role": "system", "content": source_context},
             )
 
-    payload = {
-        "model": model_id,
-        "messages": payload_messages,
-        "stream": False,
-        "max_tokens": settings.genai_max_tokens,
-    }
     headers = {
         "Authorization": f"Bearer {settings.genai_api_key}",
         "Content-Type": "application/json",
     }
+    tools = skill_tool_definitions()
+    agent_messages = list(payload_messages)
+    tool_trace: list[dict] = []
+    upstream_content: dict = {}
 
-    try:
-        async with httpx.AsyncClient(timeout=settings.genai_timeout_seconds) as client:
-            response = await client.post(
-                settings.genai_chat_url,
-                headers=headers,
-                json=payload,
-            )
-    except httpx.TimeoutException as exc:
-        raise HTTPException(status_code=504, detail="Purdue GenAI request timed out") from exc
-    except httpx.HTTPError as exc:
-        raise HTTPException(
-            status_code=502,
-            detail="Purdue GenAI request failed before a response was received",
-        ) from exc
-
-    try:
-        upstream_content = response.json()
-    except ValueError:
-        upstream_content = {
-            "detail": response.text or "Non-JSON response from Purdue GenAI"
+    # Agent loop: the model may call the skill's templates and validators, read the
+    # findings, and revise before answering. Bounded so a confused model cannot spin.
+    for _ in range(MAX_TOOL_ITERATIONS + 1):
+        payload = {
+            "model": model_id,
+            "messages": agent_messages,
+            "stream": False,
+            "max_tokens": settings.genai_max_tokens,
+            "tools": tools,
+            "tool_choice": "auto",
         }
+        try:
+            async with httpx.AsyncClient(timeout=settings.genai_timeout_seconds) as client:
+                response = await client.post(
+                    settings.genai_chat_url,
+                    headers=headers,
+                    json=payload,
+                )
+        except httpx.TimeoutException as exc:
+            raise HTTPException(
+                status_code=504, detail="Purdue GenAI request timed out"
+            ) from exc
+        except httpx.HTTPError as exc:
+            raise HTTPException(
+                status_code=502,
+                detail="Purdue GenAI request failed before a response was received",
+            ) from exc
 
-    if response.is_error:
-        return JSONResponse(status_code=response.status_code, content=upstream_content)
+        try:
+            upstream_content = response.json()
+        except ValueError:
+            upstream_content = {
+                "detail": response.text or "Non-JSON response from Purdue GenAI"
+            }
 
-    try:
-        final_text = upstream_content["choices"][0]["message"]["content"]
-    except (KeyError, IndexError, TypeError) as exc:
-        raise HTTPException(
-            status_code=502,
-            detail="Purdue GenAI returned an unexpected response format",
-        ) from exc
+        if response.is_error:
+            return JSONResponse(status_code=response.status_code, content=upstream_content)
+
+        try:
+            assistant_message = upstream_content["choices"][0]["message"]
+        except (KeyError, IndexError, TypeError) as exc:
+            raise HTTPException(
+                status_code=502,
+                detail="Purdue GenAI returned an unexpected response format",
+            ) from exc
+
+        tool_calls = assistant_message.get("tool_calls") or []
+        if not tool_calls:
+            break
+
+        # Echo the tool-call turn back verbatim, then answer each call.
+        agent_messages.append(
+            {
+                "role": "assistant",
+                "content": assistant_message.get("content") or "",
+                "tool_calls": tool_calls,
+            }
+        )
+        for call in tool_calls:
+            function = call.get("function") or {}
+            name = function.get("name", "")
+            try:
+                arguments = json.loads(function.get("arguments") or "{}")
+            except json.JSONDecodeError:
+                arguments = {}
+            if not isinstance(arguments, dict):
+                arguments = {}
+            try:
+                result = await anyio.to_thread.run_sync(
+                    _dispatch_skill_tool, settings, request.project_id, name, arguments
+                )
+            except HTTPException as exc:
+                result = {"error": str(exc.detail)}
+            except (OSError, ValueError) as exc:
+                result = {"error": str(exc)[:500]}
+            tool_trace.append(
+                {
+                    "tool": name,
+                    "arguments": {
+                        key: (value[:200] if isinstance(value, str) else value)
+                        for key, value in arguments.items()
+                    },
+                    "status": (result.get("validation") or {}).get("status")
+                    or result.get("status")
+                    or ("error" if result.get("error") else "ok"),
+                }
+            )
+            agent_messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": call.get("id", ""),
+                    "name": name,
+                    "content": json.dumps(result)[:MAX_TOOL_RESULT_CHARS],
+                }
+            )
+
+    final_text = (upstream_content.get("choices") or [{}])[0].get("message", {}).get(
+        "content"
+    )
+    if not isinstance(final_text, str) and tool_trace:
+        # The model finished by acting rather than narrating; summarize what it did
+        # so the professor still sees a response.
+        final_text = _summarize_tool_trace(tool_trace)
 
     if not isinstance(final_text, str):
         raise HTTPException(
@@ -3057,6 +3319,7 @@ async def chat(request: ChatRequest):
         "auto_decision": auto_decision,
         "artifact_spec": artifact_spec,
         "state_file": state_file_result,
+        "skill_tool_calls": tool_trace,
         "skill_runtime": skill_runtime,
         "sources_used": sources_used,
         "model": upstream_content.get("model", model_id),
@@ -3101,6 +3364,7 @@ async def chat(request: ChatRequest):
         "artifact": artifact,
         "artifact_tool_error": artifact_tool_error,
         "state_file": state_file_result,
+        "skill_tool_calls": tool_trace,
     }
 
 
