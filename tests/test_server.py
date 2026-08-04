@@ -845,7 +845,7 @@ def test_generic_json_artifact_contract_is_recovered_and_hidden():
 
     assert spec["kind"] == "worksheet"
     assert spec["title"] == "Loop Check"
-    assert "artifact generation" in cleaned
+    assert "Loop Check" in cleaned and "artifact generation" not in cleaned
     assert "```json" not in cleaned
 
 
@@ -871,7 +871,7 @@ def test_bare_artifact_contract_accepts_instructor_key_without_response_space():
     assert spec["title"] == "Loop Quiz"
     assert spec["sections"][0]["response_lines"] == 0
     assert spec["sections"][0]["bullets"] == bullets
-    assert "artifact generation" in cleaned
+    assert "Loop Quiz" in cleaned and "artifact generation" not in cleaned
 
 
 def test_incomplete_internal_json_is_replaced_with_plain_recovery_status():
@@ -1092,7 +1092,10 @@ def test_artifact_spec_repairs_model_latex_backslashes_and_allows_twelve_prompts
 
     content, artifact_spec = _extract_artifact_spec(raw)
 
-    assert content == "Prepared **VLSI quiz** for artifact generation."
+    # The reply summarizes the file rather than announcing that generation happened.
+    assert "**VLSI quiz**" in content
+    assert "artifact generation" not in content
+    assert len(content) > 60
     assert artifact_spec["sections"][0]["body"] == r"Use \(d = g\,h + p\) and explain the result."
     assert len(artifact_spec["sections"][0]["prompts"]) == 11
 

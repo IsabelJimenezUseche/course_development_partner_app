@@ -1690,6 +1690,41 @@ def _unwrap_markdown_documents(content: str) -> str:
     return MARKDOWN_DOCUMENT_FENCE.sub(replace, content).strip()
 
 
+def _artifact_spec_summary(spec: ArtifactToolRequest) -> str:
+    """Describe a generated file in the professor's terms.
+
+    When the model returns only the artifact payload, substituting a one-line receipt
+    leaves the educator holding a file and no account of what is in it. The spec
+    already carries the title, subtitle, and section headings, so summarize from
+    those rather than announcing that generation happened.
+    """
+    kind = {
+        "slides": "slide deck",
+        "document": "document",
+        "worksheet": "student worksheet",
+    }.get(spec.kind, "file")
+    lines = [f"**{spec.title}** — {kind} ready to download."]
+    if spec.subtitle:
+        lines.append("")
+        lines.append(spec.subtitle)
+    headings = [section.heading for section in spec.sections if section.heading]
+    if headings:
+        plural = "section" if len(headings) == 1 else "sections"
+        lines += ["", f"It covers {len(headings)} {plural}:", ""]
+        lines += [f"- {heading}" for heading in headings]
+    prompts = sum(len(section.prompts) for section in spec.sections)
+    checklist = sum(len(section.checklist) for section in spec.sections)
+    detail = []
+    if prompts:
+        detail.append(f"{prompts} student prompt{'s' if prompts != 1 else ''}")
+    if checklist:
+        detail.append(f"{checklist} checklist item{'s' if checklist != 1 else ''}")
+    if detail:
+        lines += ["", f"Includes {' and '.join(detail)}."]
+    lines += ["", "Open it and check the content before class."]
+    return "\n".join(lines)
+
+
 def _extract_artifact_spec(content: str) -> tuple[str, Optional[dict]]:
     """Extract a validated artifact contract from its named or generic JSON fence."""
     for pattern in ARTIFACT_SPEC_FENCES:
@@ -1702,7 +1737,7 @@ def _extract_artifact_spec(content: str) -> tuple[str, Optional[dict]]:
                 continue
             cleaned_content = (content[: match.start()] + content[match.end() :]).strip()
             if not cleaned_content:
-                cleaned_content = f"Prepared **{spec.title}** for artifact generation."
+                cleaned_content = _artifact_spec_summary(spec)
             return cleaned_content, spec.model_dump()
     trailing = _trailing_json_object(content)
     if trailing:
@@ -1714,7 +1749,7 @@ def _extract_artifact_spec(content: str) -> tuple[str, Optional[dict]]:
         else:
             cleaned_content = (content[:start] + content[end:]).strip()
             if not cleaned_content:
-                cleaned_content = f"Prepared **{spec.title}** for artifact generation."
+                cleaned_content = _artifact_spec_summary(spec)
             return cleaned_content, spec.model_dump()
     return content.strip(), None
 
