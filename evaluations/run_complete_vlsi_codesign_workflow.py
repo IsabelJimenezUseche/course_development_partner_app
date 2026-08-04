@@ -10,9 +10,13 @@ from __future__ import annotations
 
 import json
 import re
+import sys
 from pathlib import Path
 
 import httpx
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from realistic_arc import count_questions  # noqa: E402
 
 
 APP_URL = "http://127.0.0.1:8001"
@@ -136,7 +140,9 @@ def response_record(phase: str, prompt: str, response: dict, attempts: list[int]
         "prompt": prompt,
         "response": response,
         "attempts": attempts,
-        "visible_question_count": response.get("content", "").count("?")
+        # A "?" glyph is not a question: compound asks and parenthetical
+        # examples inflated this and failed replies that obeyed the limit.
+        "visible_question_count": count_questions(response.get("content", ""))
         + (1 if response.get("decision") else 0),
         "artifact_file_created": bool(artifact.get("has_file")),
     }

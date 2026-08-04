@@ -14,10 +14,14 @@ import os
 import re
 import tempfile
 from io import BytesIO
+import sys
 from pathlib import Path
 from zipfile import ZipFile, is_zipfile
 
 import httpx
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from realistic_arc import count_questions  # noqa: E402
 from pypdf import PdfReader
 
 
@@ -241,7 +245,9 @@ def response_record(phase: str, prompt: str, response: dict, attempts: list[int]
         "prompt": prompt,
         "response": response,
         "attempts": attempts,
-        "visible_question_count": response.get("content", "").count("?")
+        # A "?" glyph is not a question: compound asks and parenthetical
+        # examples inflated this and failed replies that obeyed the limit.
+        "visible_question_count": count_questions(response.get("content", ""))
         + (1 if response.get("decision") else 0),
         "artifact_file_created": bool(artifact.get("has_file")),
         "sources_used": response.get("sources_used") or [],

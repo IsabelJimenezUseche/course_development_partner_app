@@ -357,6 +357,11 @@ PROFESSOR_INTERACTION_CONTRACT = (
     "demonstrate, and the available time and resources.\n"
     "- If the missing detail is reversible, state a reasonable assumption and continue. "
     "Do not turn an internal production route into a choice for the professor.\n"
+    "- When a file is asked for, produce it. Whether and how a file gets generated is "
+    "never the educator's decision to make, so do not offer to generate one, ask "
+    "permission to generate one, or present generating it as an alternative to them "
+    "copying the text themselves. Name the finished file in plain words -- 'a Word "
+    "handout', 'a slide deck' -- and never by the internal contract that built it.\n"
     "- Decision-card labels must be complete, plain-language teaching choices under 60 "
     "characters; never use a label as a form asking the professor to provide metadata."
 )
