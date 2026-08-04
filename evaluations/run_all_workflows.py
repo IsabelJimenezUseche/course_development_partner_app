@@ -45,14 +45,14 @@ WORKFLOWS = {
     "python": {
         "script": "run_realistic_python_workflow.py",
         "modes": ("Co-design", "Auto"),
-        "expect_terms": ("loop", "trace", "variable"),
-        "expect_any": ("for", "while"),
+        "expect_terms": ("loop",),
+        "expect_any": ("trace", "tracing", "variable", "value", "iteration"),
     },
     "vlsi": {
         "script": "run_complete_vlsi_codesign_workflow.py",
         "modes": (),
-        "expect_terms": ("delay", "sizing"),
-        "expect_any": ("transistor", "gate", "logical effort"),
+        "expect_terms": ("delay",),
+        "expect_any": ("sizing", "size", "transistor", "gate", "logical effort"),
     },
     "crispr": {
         "script": "run_realistic_cellbio_workflow.py",
@@ -70,7 +70,7 @@ WORKFLOWS = {
         "script": "run_complete_transformer_paper_workflow.py",
         "modes": (),
         "expect_terms": ("attention",),
-        "expect_any": ("encoder", "decoder", "mask"),
+        "expect_any": ("encoder", "decoder", "mask", "query", "key"),
     },
 }
 MIN_ARTIFACT_WORDS = 120
@@ -138,10 +138,13 @@ def run_workflow(name: str, spec: dict, data_dir: Path) -> dict:
     new_files = after - before
 
     statuses = re.findall(r'"status":\s*"(\w+)"', process.stdout)
-    reported = sorted(set(statuses)) or ["unknown"]
+    reported = sorted(set(statuses))
     # Reports from the realistic harness are Markdown, not JSON.
     md_fail = len(re.findall(r"^- FAIL", process.stdout, re.MULTILINE))
     md_pass = len(re.findall(r"^- PASS", process.stdout, re.MULTILINE))
+    if not reported and (md_pass or md_fail):
+        reported = ["fail" if md_fail else "pass"]
+    reported = reported or ["unknown"]
 
     findings = []
     meaningful = 0

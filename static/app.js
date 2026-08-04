@@ -692,6 +692,48 @@ async function saveProject() {
   } catch (error) { setSaveStatus("Save failed", "error"); }
 }
 
+// The workspace is only fetched when the professor acts, so a project changed
+// elsewhere — another tab, a colleague, an evaluation run — leaves this browser
+// showing a stale conversation. The visible symptom is a decision card that stays
+// open after the decision has already been answered, and clicking it would post a
+// second answer to a question the server considers settled.
+async function refreshOpenProject() {
+  if (!state.projectId || state.busy) return;
+  let workspace;
+  try {
+    const response = await fetch(`/api/projects/${encodeURIComponent(state.projectId)}`);
+    if (!response.ok) return;
+    workspace = await response.json();
+  } catch (error) {
+    return; // a transient network failure must not disturb what is on screen
+  }
+  const incoming = workspace.messages || [];
+  if (incoming.length === state.messages.length) {
+    dismissResolvedDecision(incoming);
+    return;
+  }
+  state.messages = incoming;
+  state.artifacts = workspace.artifacts || [];
+  state.project = workspace.project || state.project;
+  renderArtifacts();
+  renderConversation();
+  dismissResolvedDecision(incoming);
+}
+
+function dismissResolvedDecision(messages) {
+  const pending = state.pendingDecision;
+  if (!pending || !elements.decisionDialog.open) return;
+  const answered = new Set(
+    messages.map((message) => message.decision_trace?.origin_message_id).filter(Boolean)
+  );
+  if (answered.has(pending.origin_message_id)) {
+    state.pendingDecision = null;
+    closeDialog(elements.decisionDialog);
+    elements.composerHelp.textContent =
+      "That choice was already answered elsewhere; this project is up to date.";
+  }
+}
+
 async function uploadProjectFiles(files) {
   const selectedFiles = Array.from(files || []); if (!selectedFiles.length || !state.projectId) return;
   elements.uploadStatus.classList.remove("error");
@@ -883,5 +925,11 @@ elements.dropZone.addEventListener("keydown", (event) => { if (event.key === "En
 elements.dropZone.addEventListener("drop", (event) => uploadProjectFiles(event.dataTransfer.files));
 document.querySelectorAll("[data-close]").forEach((button) => button.addEventListener("click", () => closeDialog(document.getElementById(button.dataset.close))));
 document.querySelectorAll("dialog").forEach((dialog) => dialog.addEventListener("click", (event) => { if (event.target === dialog) closeDialog(dialog); }));
+
+// Re-sync when the professor comes back to the tab, and while a decision card is
+// open, since that is the one state where acting on stale data does real damage.
+document.addEventListener("visibilitychange", () => { if (!document.hidden) refreshOpenProject(); });
+window.addEventListener("focus", () => refreshOpenProject());
+setInterval(() => { if (!document.hidden && elements.decisionDialog.open) refreshOpenProject(); }, 5000);
 
 initialize().catch((error) => { elements.modelStatus.classList.add("error"); setModelStatus("Workspace unavailable"); elements.composerHelp.textContent = error.message; });
