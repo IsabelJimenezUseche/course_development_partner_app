@@ -1262,3 +1262,144 @@ def test_settings_masks_api_key_and_updates_selected_env(monkeypatch, tmp_path):
     assert patch_response.status_code == 200
     assert patch_response.json()["restart_required"] is True
     assert "PURDUE_GENAI_MODEL_ID='gpt-oss:120b'" in env_paths["current"].read_text()
+
+
+def test_latex_is_rewritten_into_readable_notation():
+    """The app renders Markdown, not maths, so LaTeX reaches the educator verbatim."""
+    rendered = _render_markdown(
+        r"compute the electrical effort (h = C_{\text{load}}/C_{\text{in}}) per stage"
+    )
+
+    assert "C_load/C_in" in rendered
+    assert "\\text" not in rendered
+    assert "{" not in rendered
+
+
+def test_latex_delimiters_and_symbols_are_converted():
+    for source, expected in (
+        (r"Apply $\frac{C_{out}}{C_{in}}$ now.", "C_out/C_in"),
+        (r"We use \(d = gh + p\).", "d = gh + p"),
+        (r"\[ E = \frac{1}{2} C V^2 \]", "1/2 C V^2"),
+        (r"gain \times 2 and \tau \le 5 ns", "×"),
+        (r"stage effort \sqrt{F}", "√(F)"),
+    ):
+        assert expected in server._plain_math(source), source
+
+
+def test_plain_math_never_touches_code():
+    """A Python lesson's code must survive byte for byte, backslashes included."""
+    source = 'Trace it:\n\n```python\nprint("a\\tb")\ntotal += n\n```\n\nthen discuss.'
+
+    assert server._plain_math(source) == source
+    assert server._plain_math("Use `C_{\\text{in}}` here.") == "Use `C_{\\text{in}}` here."
+
+
+def test_plain_math_leaves_ordinary_prose_alone():
+    prose = "No mathematics here, just teaching prose about loops."
+
+    assert server._plain_math(prose) == prose
+
+
+def test_artifact_sections_without_content_are_dropped():
+    """A dry run shipped a quiz with 'Questions' and 'Answer Key' and no questions."""
+    spec = server.ArtifactToolRequest.model_validate(
+        {
+            "kind": "document",
+            "title": "Formative Loop-Tracing Quiz",
+            "sections": [
+                {"heading": "Instructions", "body": "Work silently; show all work."},
+                {"heading": "Questions"},
+                {"heading": "Answer Key (Instructor Use Only)"},
+            ],
+        }
+    )
+
+    assert [section.heading for section in spec.sections] == ["Instructions"]
+
+
+def test_artifact_with_no_renderable_section_is_rejected():
+    with pytest.raises(ValueError):
+        server.ArtifactToolRequest.model_validate(
+            {
+                "kind": "document",
+                "title": "Hollow",
+                "sections": [{"heading": "Questions"}, {"heading": "Answer Key"}],
+            }
+        )
+
+
+def test_response_lines_alone_do_not_make_a_section_renderable():
+    """Blank ruled space under a bare heading is an empty quiz, not a question."""
+    with pytest.raises(ValueError):
+        server.ArtifactToolRequest.model_validate(
+            {
+                "kind": "worksheet",
+                "title": "Blank",
+                "sections": [{"heading": "Question 1", "response_lines": 6}],
+            }
+        )
+
+
+def test_a_table_only_section_is_kept():
+    """Worksheet content often lives entirely in a table; that is real content."""
+    spec = server.ArtifactToolRequest.model_validate(
+        {
+            "kind": "worksheet",
+            "title": "Trace",
+            "sections": [
+                {
+                    "heading": "Q1",
+                    "table": {"headers": ["pass", "total"], "rows": [["1", "2"]]},
+                }
+            ],
+        }
+    )
+
+    assert len(spec.sections) == 1
+
+
+def test_internal_contract_names_never_reach_the_professor():
+    """Prompt instructions alone did not hold, so the scrub is deterministic."""
+    for source in (
+        "| **Word file** (editable) – see `artifact_spec` below | notes |",
+        "I will emit the artifact_spec now.",
+        "Saved to state_file for you.",
+    ):
+        cleaned = server._strip_internal_references(source)
+        assert "artifact_spec" not in cleaned
+        assert "state_file" not in cleaned
+
+    prose = "A normal sentence about worksheets and specifications."
+    assert server._strip_internal_references(prose) == prose
+
+
+def _realistic_arc():
+    import importlib.util
+
+    spec = importlib.util.spec_from_file_location(
+        "realistic_arc", Path(__file__).resolve().parents[1] / "evaluations" / "realistic_arc.py"
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def test_question_counter_ignores_drafted_student_material():
+    """A reply that drafts quiz items is not interrogating the professor."""
+    arc = _realistic_arc()
+
+    asks_only = "A few things:\n1. What should students do?\n2. How long is the class?"
+    with_draft = (
+        "Two questions:\n1. How long is the class?\n2. Graded or practice?\n\n"
+        "**Draft quiz**\n1. What is i on pass 3?\n2. What prints for x?"
+    )
+
+    assert arc.count_questions(asks_only) == 2
+    assert arc.count_questions(with_draft) == 2  # the drafted items are not asks
+    assert arc.count_questions("Here is the plan with timings.") == 0
+
+
+def test_question_counter_does_not_count_parenthetical_examples():
+    arc = _realistic_arc()
+
+    assert arc.count_questions('How long is the lab? (e.g. "50 minutes?")') == 1

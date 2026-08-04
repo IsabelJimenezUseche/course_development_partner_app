@@ -32,7 +32,7 @@ from openpyxl import load_workbook
 from markdown_it import MarkdownIt
 from pptx import Presentation
 from pypdf import PdfReader
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, model_validator
 
 from artifact_tools import build_artifact_file
 
@@ -240,6 +240,20 @@ class ArtifactSectionSpec(BaseModel):
     response_lines: int = Field(default=3, ge=0, le=12)
     table: Optional[ArtifactTableSpec] = None
 
+    def has_content(self) -> bool:
+        """Whether this section renders anything beneath its heading.
+
+        Response lines alone do not count: blank ruled space under a bare heading is
+        what an empty quiz looks like, not a question.
+        """
+        return bool(
+            self.body.strip()
+            or self.bullets
+            or self.prompts
+            or self.checklist
+            or (self.table and (self.table.headers or self.table.rows))
+        )
+
 
 class ArtifactToolRequest(BaseModel):
     kind: Literal["slides", "document", "worksheet"]
@@ -247,6 +261,21 @@ class ArtifactToolRequest(BaseModel):
     subtitle: str = Field(default="", max_length=240)
     sections: list[ArtifactSectionSpec] = Field(min_length=1, max_length=12)
     source_ids: list[str] = Field(default_factory=list, max_length=20)
+
+    @model_validator(mode="after")
+    def _require_renderable_sections(self) -> "ArtifactToolRequest":
+        """Never hand an educator a file whose headings have nothing beneath them.
+
+        Observed in a dry run: a quiz shipped with `Questions` and `Answer Key`
+        headings and no questions. Drop the hollow sections rather than fail the
+        whole file, so a deck with one bad section still delivers the good ones;
+        if nothing renders at all there is no artifact worth building.
+        """
+        kept = [section for section in self.sections if section.has_content()]
+        if not kept:
+            raise ValueError("artifact has no section with renderable content")
+        self.sections = kept
+        return self
 
 
 class StateFileWrite(BaseModel):
@@ -1814,12 +1843,100 @@ def _recover_professor_clarification(content: str, profile: str) -> str:
     )
 
 
+# The app renders Markdown, not maths. LaTeX the model emits therefore reaches the
+# educator verbatim -- "C_{\text{load}}/C_{\text{in}}" instead of "C_load/C_in" -- and
+# carries into Word and PowerPoint, where it will never render either. Rewrite the
+# constructs that actually turn up into readable notation rather than adding a maths
+# engine to a local pilot.
+LATEX_SYMBOLS = {
+    r"\alpha": "α", r"\beta": "β", r"\gamma": "γ", r"\delta": "δ", r"\Delta": "Δ",
+    r"\epsilon": "ε", r"\theta": "θ", r"\lambda": "λ", r"\mu": "µ", r"\pi": "π",
+    r"\rho": "ρ", r"\sigma": "σ", r"\Sigma": "Σ", r"\tau": "τ", r"\phi": "φ",
+    r"\omega": "ω", r"\Omega": "Ω", r"\approx": "≈", r"\times": "×", r"\cdot": "·",
+    r"\le": "≤", r"\leq": "≤", r"\ge": "≥", r"\geq": "≥", r"\neq": "≠",
+    r"\pm": "±", r"\infty": "∞", r"\propto": "∝", r"\rightarrow": "→",
+    r"\to": "→", r"\ll": "≪", r"\gg": "≫",
+}
+_CODE_FENCE = re.compile(r"```.*?```|`[^`\n]+`", re.DOTALL)
+_MATH_DELIMS = (
+    re.compile(r"\\\[(.+?)\\\]", re.DOTALL),
+    re.compile(r"\\\((.+?)\\\)", re.DOTALL),
+    re.compile(r"(?<!\$)\$([^$\n]{1,200})\$(?!\$)"),
+)
+_LATEX_WRAPPER = re.compile(r"\\(?:text|mathrm|mathbf|mathit|operatorname)\{([^{}]*)\}")
+_LATEX_FRAC = re.compile(r"\\d?frac\{([^{}]*)\}\{([^{}]*)\}")
+_LATEX_SUBSUP = re.compile(r"([_^])\{([^{}]{1,24})\}")
+_LATEX_SQRT = re.compile(r"\\sqrt\{([^{}]*)\}")
+
+
+def _latex_to_readable(fragment: str, *, strip_edges: bool = True) -> str:
+    """Turn a LaTeX fragment into notation a professor can read in plain text.
+
+    `strip_edges` is right when replacing the contents of `$...$`, and wrong when
+    converting a whole passage: trimming there eats the newline before a code fence
+    and silently breaks the Markdown around it.
+    """
+    for _ in range(3):  # nested wrappers such as C_{\text{load}} need a second pass
+        previous = fragment
+        fragment = _LATEX_WRAPPER.sub(r"\1", fragment)
+        fragment = _LATEX_SQRT.sub(r"√(\1)", fragment)
+        fragment = _LATEX_FRAC.sub(r"\1/\2", fragment)
+        fragment = _LATEX_SUBSUP.sub(r"\1\2", fragment)
+        if fragment == previous:
+            break
+    for command, symbol in LATEX_SYMBOLS.items():
+        fragment = re.sub(re.escape(command) + r"(?![A-Za-z])", symbol, fragment)
+    fragment = re.sub(r"\\[,;:!]", " ", fragment)
+    fragment = fragment.replace(r"\\", " ")
+    fragment = re.sub(r"[ \t]{2,}", " ", fragment)
+    return fragment.strip() if strip_edges else fragment
+
+
+def _plain_math(content: str) -> str:
+    """Rewrite LaTeX outside code spans; code is left exactly as the author wrote it."""
+    if not content or ("\\" not in content and "$" not in content):
+        return content
+
+    def convert(text: str) -> str:
+        for pattern in _MATH_DELIMS:
+            text = pattern.sub(lambda m: _latex_to_readable(m.group(1)), text)
+        return _latex_to_readable(text, strip_edges=False)
+
+    pieces = []
+    last = 0
+    for match in _CODE_FENCE.finditer(content):
+        pieces.append(convert(content[last : match.start()]))
+        pieces.append(match.group(0))  # code stays verbatim
+        last = match.end()
+    pieces.append(convert(content[last:]))
+    return "".join(pieces)
+
+
+# The model keeps naming internal contracts in prose ("see `artifact_spec` below")
+# even when the prompt forbids it. Instructions alone have not held, so strip the
+# jargon deterministically on the way out rather than trusting the next wording.
+_INTERNAL_REFERENCE = re.compile(
+    r"\s*[–—-]?\s*\(?see\s+`?(?:artifact_spec|state_file)`?\s+(?:below|above)\)?",
+    re.IGNORECASE,
+)
+_INTERNAL_TOKEN = re.compile(
+    r"(?:\b(?:the|an|a)\s+)?`?\b(?:artifact_spec|state_file)\b`?", re.IGNORECASE
+)
+
+
+def _strip_internal_references(content: str) -> str:
+    cleaned = _INTERNAL_REFERENCE.sub("", content)
+    return _INTERNAL_TOKEN.sub("the generated file", cleaned)
+
+
 def _prepare_professor_display_content(content: str) -> str:
     """Normalize legacy and current responses before they reach chat or preview."""
     display = _unwrap_markdown_documents(content)
     display, _ = _extract_artifact_spec(display)
     display, _ = _extract_state_file(display)
-    return _hide_incomplete_internal_payloads(display)
+    return _strip_internal_references(
+        _plain_math(_hide_incomplete_internal_payloads(display))
+    )
 
 
 def _sanitize_professor_decision(

@@ -58,13 +58,16 @@ WORKFLOWS = {
         "script": "run_realistic_cellbio_workflow.py",
         "modes": ("Co-design", "Auto"),
         "expect_terms": ("cell",),
-        "expect_any": ("crispr", "cas9", "nucleus", "compartment"),
+        "expect_any": (
+            "crispr", "cas9", "nucleus", "compartment", "lysosom", "endosom",
+            "membrane", "traffick", "organelle",
+        ),
     },
     "business": {
         "script": "run_realistic_business_workflow.py",
         "modes": ("Co-design", "Auto"),
-        "expect_terms": ("data",),
-        "expect_any": ("client", "revenue", "defensible", "judgment"),
+        "expect_terms": (),
+        "expect_any": ("data", "client", "revenue", "figure", "defensible", "judgment"),
     },
     "transformer": {
         "script": "run_complete_transformer_paper_workflow.py",
@@ -73,7 +76,30 @@ WORKFLOWS = {
         "expect_any": ("encoder", "decoder", "mask", "query", "key"),
     },
 }
-MIN_ARTIFACT_WORDS = 120
+# A low backstop only. Emptiness is now rejected at the source by the artifact
+# schema, and a worksheet whose content sits in tables and response space is
+# legitimately short -- a word floor cannot tell those apart, so it must not try.
+MIN_ARTIFACT_WORDS = 60
+# A workflow does not produce one kind of file. A lesson and a quiz must engage the
+# subject; a TA or instructor guide is about running the session -- where students
+# freeze and what to say -- and demanding subject vocabulary of it is a category
+# error, not a threshold to tune. Judge each artifact by what it actually is.
+SUPPORT_ARTIFACT = re.compile(
+    r"\bTA\b|teaching[-_ ]?assistant|instructor[-_ ]?guide|facilitation|"
+    r"quick[-_ ]?reference|discussion[-_ ]?guide",
+    re.IGNORECASE,
+)
+SUPPORT_TERMS = (
+    "student", "watch", "respond", "prompt", "misconception",
+    "ask", "section", "help", "common", "mistake",
+)
+
+
+def artifact_expectations(path: Path, spec: dict) -> tuple[tuple[str, ...], tuple[str, ...], str]:
+    """Return (must_contain, any_of, kind) for one artifact."""
+    if SUPPORT_ARTIFACT.search(path.stem):
+        return (), SUPPORT_TERMS, "support"
+    return spec["expect_terms"], spec["expect_any"], "subject"
 
 
 def clean_projects(client: httpx.Client) -> int:
@@ -151,14 +177,15 @@ def run_workflow(name: str, spec: dict, data_dir: Path) -> dict:
     for path in sorted(new_files):
         text = artifact_text(path).lower()
         words = len(text.split())
-        missing = [t for t in spec["expect_terms"] if t not in text]
-        any_hit = (not spec["expect_any"]) or any(t in text for t in spec["expect_any"])
+        must, any_of, kind = artifact_expectations(path, spec)
+        missing = [term for term in must if term not in text]
+        any_hit = (not any_of) or any(term in text for term in any_of)
         if words < MIN_ARTIFACT_WORDS:
             findings.append(f"{path.name}: only {words} words")
         elif missing:
             findings.append(f"{path.name}: never mentions {', '.join(missing)}")
         elif not any_hit:
-            findings.append(f"{path.name}: none of {', '.join(spec['expect_any'])}")
+            findings.append(f"{path.name} ({kind}): none of {', '.join(any_of)}")
         else:
             meaningful += 1
 

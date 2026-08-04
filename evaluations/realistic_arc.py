@@ -100,18 +100,33 @@ _PARENTHETICAL = re.compile(r"\([^)]*\)")
 _QUOTED = re.compile(r"[\"“”][^\"“”]*[\"“”]|'[^']{4,}'")
 
 
+# A reply that drafts quiz items is full of question marks aimed at students, not
+# at the educator. Once a heading announces proposed content, later questions are
+# the deliverable rather than an ask, and counting them punished a good reply.
+_CONTENT_HEADING = re.compile(
+    r"^\s{0,3}(?:#{1,6}\s*|\*\*)?\s*(?:draft|proposed|sample|example|quiz|"
+    r"question\s*\d|assessment|worksheet|item\s*\d)",
+    re.IGNORECASE,
+)
+
+
 def count_questions(text: str) -> int:
     """Count questions actually put to the educator.
 
     One line that ends in `?` is one question however many clauses it joins.
-    Examples in parentheses or quotes are illustrations of an answer, not new asks.
+    Examples in parentheses or quotes illustrate an answer rather than adding an ask,
+    and anything after a heading that announces drafted content is material for
+    students, not a question for the professor.
     """
     if not text:
         return 0
     asked = 0
+    in_content = False
     for line in text.splitlines():
+        if _CONTENT_HEADING.match(line):
+            in_content = True
         stripped = _QUOTED.sub(" ", _PARENTHETICAL.sub(" ", line)).strip()
-        if not stripped:
+        if not stripped or in_content or stripped.startswith(">"):
             continue
         # Bare interrogatives inside a sentence do not count; the line has to ask.
         if stripped.rstrip("*_` ").endswith("?"):
@@ -218,9 +233,15 @@ def run_scenario(client: TestClient, scenario: Scenario, mode: str) -> dict:
         checks["auto_no_question_requests"] = not any(
             p in visible for p in PROFESSOR_QUESTION_PATTERNS
         )
-        # Delegation means the brief is answered in full, not in fragments.
-        checks["auto_front_loaded_substantive"] = (
-            turns[0].get("reply_chars", 0) > 400 if turns else False
+        # Delegation means the brief is answered in full, not in fragments. Handing
+        # back a finished file is the fullest possible answer, so a short covering
+        # note above a delivered artifact is success -- the earlier character floor
+        # measured the length of this app's own file summary, not the model's work.
+        first = turns[0] if turns else {}
+        checks["auto_front_loaded_substantive"] = bool(
+            first.get("artifact")
+            or first.get("state_file")
+            or first.get("reply_chars", 0) > 400
         )
     else:
         checks["codesign_engaged_early"] = any(
