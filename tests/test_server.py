@@ -183,6 +183,18 @@ def test_framework_mention_defers_to_the_specific_task_route():
     assert profile == "assessment"
 
 
+def test_named_grading_schemes_route_to_assessment_not_framework():
+    """Every named scheme contains "grading", so the assessment route claims it first —
+    which is where the crosswalk's own §5 sends grading schemes. Pin that deliberately
+    so nobody re-adds the scheme names to FRAMEWORK_SIGNAL as reachable patterns."""
+    for text in (
+        "Help me set up specifications grading for this course",
+        "I want to move to ungrading next semester",
+        "Explain standards-based grading to my TAs",
+    ):
+        assert _infer_skill_profile([ChatMessage(role="user", content=text)]) == "assessment"
+
+
 def test_syllabus_and_delivery_adaptation_route_to_course_profile():
     """The skill update added syllabi and online/hybrid adaptation to its scope."""
     for text in (
@@ -211,8 +223,12 @@ def test_design_profile_supplies_the_verified_bibliography():
     prompt, runtime = _load_skill_runtime(get_settings(), "design")
 
     assert "references/bibliography.md" in runtime["loaded_files"]
-    assert "Anchor Bibliography" in prompt
-    assert "Freeman, S." in prompt  # a verified entry, not just the file's name
+    # The installed file's own content proves the entries reach the prompt verbatim,
+    # without pinning this test to any particular bibliography entry.
+    bibliography = (
+        get_settings().skill_dir / "references" / "bibliography.md"
+    ).read_text(encoding="utf-8")
+    assert bibliography.strip() in prompt
 
 
 def test_every_profile_route_names_installed_skill_files():

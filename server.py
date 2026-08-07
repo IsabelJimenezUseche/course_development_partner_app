@@ -481,15 +481,20 @@ ENVIRONMENT_FIELDS = {
 
 # Supplied-framework names the skill's crosswalk covers. Word boundaries matter:
 # substring matching would route "diabetes" through "abet" and "algal blooms"
-# through "bloom", so short acronyms and possessives are anchored.
+# through "bloom", so short acronyms and possessives are anchored. Named grading
+# schemes (specifications grading, ungrading, ...) are deliberately absent: they
+# all contain "grading", so the assessment route claims them first, which is where
+# the crosswalk itself sends grading schemes.
 FRAMEWORK_SIGNAL = re.compile(
     r"\b(?:abet|cdio|udl|washington accord|bloom['’]s|solo taxonomy|"
     r"depth of knowledge|universal design for learning|accreditation|"
     r"pogil|peer instruction|just-in-time teaching|flipped classroom|"
     r"flipped course|scale-up|problem-based learning|project-based learning|"
-    r"model-eliciting|productive failure|specifications grading|"
-    r"standards-based grading|mastery grading|ungrading)\b"
+    r"model-eliciting|productive failure)\b"
 )
+# "ada" needs the same word anchoring: as a substring it reads "adapt",
+# "adaptation", and "Canada" as the ADA statute.
+ADA_SIGNAL = re.compile(r"\bada\b")
 
 
 def _infer_skill_profile(messages: list[ChatMessage]) -> str:
@@ -499,10 +504,8 @@ def _infer_skill_profile(messages: list[ChatMessage]) -> str:
     )
     routes = [
         ("assessment", ("assessment", "exam", "quiz", "rubric", "grading", "score")),
-        # "ada" is a whole-word pattern: as a substring it reads "adapt", "adaptation",
-        # and "Canada" as the ADA statute.
         ("accessibility", (
-            "accessibility", "accessible", re.compile(r"\bada\b"), "wcag", "accommodation",
+            "accessibility", "accessible", ADA_SIGNAL, "wcag", "accommodation",
         )),
         ("stem", (
             "engineering", "computing", "laborator", "hazard", "safety", "uncertainty",
