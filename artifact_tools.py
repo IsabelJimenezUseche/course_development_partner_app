@@ -16,13 +16,15 @@ from pptx.enum.text import PP_ALIGN, MSO_ANCHOR
 from pptx.util import Inches as PptxInches, Pt as PptxPt
 
 
-PURDUE_BLACK = "000000"
-PURDUE_GOLD = "CFB991"
-PURDUE_DARK_GOLD = "8E6F3E"
-PURDUE_AGED = "F4EDDF"
-INK = "202124"
-MUTED = "5B5F63"
-LIGHT_LINE = "D9D4CC"
+# Every value is a semantic role from the example palette in the skill's
+# references/visual-design.md; that reference rules out improvised colors, so a
+# new color here must come from the palette table with its contrast pair.
+PURDUE_BLACK = "000000"  # Primary dark: body text, strong headings, rules
+PURDUE_GOLD = "CFB991"  # Primary accent: bands and highlights with black text
+PURDUE_DARK_GOLD = "8E6F3E"  # Warm dark accent (Bronze): limited emphasis
+INK = PURDUE_BLACK
+MUTED = "555960"  # Dark neutral (Graphite): secondary text
+LIGHT_LINE = "C4BFC0"  # Light neutral (Light gray): dividers and quiet borders
 
 
 def _set_run_font(run, *, name: str = "Arial", size: float = 11, bold: bool = False, color: str = INK) -> None:

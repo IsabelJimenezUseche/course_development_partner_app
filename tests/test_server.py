@@ -231,6 +231,33 @@ def test_design_profile_supplies_the_verified_bibliography():
     assert bibliography.strip() in prompt
 
 
+def test_artifact_profiles_load_the_visual_design_mode_rule():
+    """The skill update turned palette selection into a mode rule (visual-design.md §3)
+    that artifact-patterns.md defers to; producing visuals without the file in the
+    prompt invites improvised colors, which the rule forbids in every mode."""
+    for profile in ("artifact", "accessibility"):
+        _, runtime = _load_skill_runtime(get_settings(), profile)
+        assert "references/visual-design.md" in runtime["loaded_files"], profile
+
+
+def test_artifact_tool_colors_come_from_the_skill_example_palette():
+    """visual-design.md rules out improvised colors: every value the deterministic
+    renderer uses must be a role from the example palette table, whose verified
+    contrast pairs are the recorded evidence."""
+    import artifact_tools
+
+    reference = (
+        get_settings().skill_dir / "references" / "visual-design.md"
+    ).read_text(encoding="utf-8")
+    palette = set(re.findall(r"`#([0-9A-Fa-f]{6})`", reference))
+    used = {
+        value
+        for name, value in vars(artifact_tools).items()
+        if name.isupper() and isinstance(value, str) and re.fullmatch(r"[0-9A-Fa-f]{6}", value)
+    }
+    assert used <= palette, f"colors outside the example palette: {sorted(used - palette)}"
+
+
 def test_every_profile_route_names_installed_skill_files():
     """A skill rename or removal must fail here, not as a 503 in front of a professor."""
     settings = get_settings()
@@ -260,9 +287,10 @@ def test_skill_references_are_routed_or_deliberately_excluded():
         # The app pins its own five tools; connector and tool selection never reach the model.
         "tool-routing.md",
         "mcp-capability-contracts.md",
-        # Office production is delegated to the local deterministic artifact tool.
+        # Office production is delegated to the local deterministic artifact tool,
+        # which renders with the example palette from visual-design.md; that reference
+        # itself is routed so previews name the palette per its §3 mode rule.
         "rich-artifact-production.md",
-        "visual-design.md",
         # The asset templates are supplied verbatim instead; they carry the schema.
         "state-contract.md",
         # External-search protocol; the app has no web retrieval, and the verified
@@ -823,6 +851,56 @@ def test_structured_decision_is_removed_and_parsed():
     assert content == "Choose an evidence pattern."
     assert decision["question"] == "Which pattern?"
     assert len(decision["options"]) == 2
+
+
+def test_suggested_replies_line_is_stripped_when_the_native_card_renders():
+    """The skill's portable fallback line ('Suggested replies: "1" | ...') is for
+    clients without a native choice control; next to the app's own decision buttons
+    it is duplicate chrome."""
+    content, decision = _extract_decision(
+        "Pick a pattern.\n\n"
+        'Suggested replies: "1" | "2" | "modify: <your change>" | "decide for me"\n\n'
+        "```decision\n"
+        '{"question":"Which pattern?","options":['
+        '{"label":"A (Recommended)","description":"Best aligned","value":"a"},'
+        '{"label":"B","description":"Alternative","value":"b"}]}\n```'
+    )
+
+    assert decision is not None
+    assert content == "Pick a pattern."
+
+
+def test_suggested_replies_line_survives_when_no_card_is_recovered():
+    """Without a rendered card, typed replies are the educator's only cheap answer."""
+    content, decision = _extract_decision(
+        "Here is the plan summary.\n\n"
+        'Suggested replies: "approve" | "modify: <your change>"'
+    )
+
+    assert decision is None
+    assert "Suggested replies" in content
+
+
+def test_interactive_modes_scope_approval_to_the_presented_piece():
+    """One preview approval never authorizes the remaining artifact family; skipping
+    checkpoints is a mode change only the educator can name."""
+    for mode in ("Co-design", "Guided"):
+        instruction = _collaboration_mode_instruction(mode)
+        assert "only the piece just presented" in instruction, mode
+        assert "mode change" in instruction, mode
+    assert "piece just presented" not in _collaboration_mode_instruction("Auto")
+    assert "piece just presented" not in _collaboration_mode_instruction("Rapid")
+
+
+def test_decision_dialog_offers_decide_for_me_delegation():
+    """The skill requires a native choice affordance to carry 'decide for me' as an
+    explicit option, delegating the current decision to the recommendation."""
+    app_js = (server.APP_DIR / "static" / "app.js").read_text(encoding="utf-8")
+    index_html = (server.APP_DIR / "static" / "index.html").read_text(encoding="utf-8")
+
+    assert 'id="delegateDecisionButton"' in index_html
+    assert "delegateDecisionButton" in app_js
+    assert "recommendedOption" in app_js
 
 
 def test_new_project_defaults_to_co_design_mode(monkeypatch, tmp_path):

@@ -12,7 +12,7 @@ const elements = {
   currentProjectName: $("#currentProjectName"), projectSwitcher: $("#projectSwitcher"),
   projectsDialog: $("#projectsDialog"), projectList: $("#projectList"), newProjectButton: $("#newProjectButton"),
   decisionDialog: $("#decisionDialog"), decisionTitle: $("#decisionTitle"), decisionQuestion: $("#decisionQuestion"), decisionStatus: $("#decisionStatus"),
-  decisionOptions: $("#decisionOptions"), customDecisionButton: $("#customDecisionButton"),
+  decisionOptions: $("#decisionOptions"), customDecisionButton: $("#customDecisionButton"), delegateDecisionButton: $("#delegateDecisionButton"),
   artifactsButton: $("#artifactsButton"), artifactCount: $("#artifactCount"),
   artifactsDialog: $("#artifactsDialog"), artifactList: $("#artifactList"),
   artifactToolButton: $("#artifactToolButton"), artifactToolDialog: $("#artifactToolDialog"),
@@ -483,6 +483,25 @@ function showDecision(decision, originMessageId = null, savedSelection = null) {
     });
     elements.decisionOptions.appendChild(button);
   });
+  // "Decide for me" delegates this decision only: it sends the recommended option
+  // (first, per the decision contract) and records the choice like any other selection.
+  const recommendedOption = decision.options.find((option) => /\(recommended\)/i.test(option.label)) || decision.options[0];
+  elements.delegateDecisionButton.hidden = Boolean(recordedSelection);
+  elements.delegateDecisionButton.onclick = async () => {
+    closeDialog(elements.decisionDialog);
+    state.pendingDecision = null;
+    await requestDesignPartner(
+      recommendedOption.value,
+      `Decide for me → ${recommendedOption.label}\n${recommendedOption.description}`,
+      decision.skill_profile || "auto",
+      {
+        origin_message_id: originMessageId,
+        question: decision.question,
+        selected_label: recommendedOption.label,
+        selected_value: recommendedOption.value,
+      },
+    );
+  };
   elements.customDecisionButton.onclick = () => {
     state.pendingDecision = { origin_message_id: originMessageId, question: decision.question };
     closeDialog(elements.decisionDialog);

@@ -304,9 +304,12 @@ SKILL_REFERENCE_ROUTES = {
     # through the crosswalk; evidence-informed-design carries the mechanisms the
     # crosswalk's pedagogy-format table points into.
     "framework": ["framework-crosswalk.md", "evidence-informed-design.md"],
-    "artifact": ["artifact-patterns.md", "evidence-informed-design.md"],
+    # visual-design.md rides with artifact work because artifact-patterns.md defers
+    # palette selection to its §3 mode rule: without the file in the prompt the model
+    # improvises colors, which that rule forbids in every mode.
+    "artifact": ["artifact-patterns.md", "evidence-informed-design.md", "visual-design.md"],
     "assessment": ["assessment-quality.md", "artifact-patterns.md"],
-    "accessibility": ["accessibility-and-compliance.md", "artifact-patterns.md"],
+    "accessibility": ["accessibility-and-compliance.md", "artifact-patterns.md", "visual-design.md"],
     "course": ["course-coherence-and-implementation.md", "design-workflow.md"],
     "stem": ["stem-authenticity.md", "artifact-patterns.md"],
     "validation": ["validation-checklists.md", "portability.md"],
@@ -406,12 +409,17 @@ PROFESSOR_INTERACTION_CONTRACT = (
     "characters; never use a label as a form asking the professor to provide metadata."
 )
 STRUCTURED_DECISION_CONTRACT = (
-    "When the next useful interaction requires the instructor to choose among alternatives, "
+    "This app is the native choice affordance described in references/interaction-protocol.md: "
+    "a fenced `decision` block renders as selectable buttons with a built-in 'Decide for me' "
+    "action. When the next useful interaction requires the instructor to choose among "
+    "alternatives — including a choice of visual identity or of how a grade is composed — "
     "end the response with exactly one fenced `decision` JSON block using this schema: "
     '{"question":"One concise question","options":[{"label":"Short label",'
     '"description":"Consequence or tradeoff","value":"Text to send if chosen"}]}. '
     "Provide two or three mutually exclusive options. Put the recommended option first and "
-    "include '(Recommended)' in its label. Do not emit this block when a choice is not needed."
+    "include '(Recommended)' in its label. The rendered buttons replace the markdown card, "
+    "so do not add a 'Suggested replies:' line and do not restate the options in prose. "
+    "Do not emit this block when a choice is not needed."
 )
 SKILL_TOOL_CONTRACT = (
     "You have working tools for the skill's portable state. Prefer them over describing "
@@ -450,6 +458,10 @@ ARTIFACT_TOOL_CONTRACT = (
     "Use only source IDs present in the supplied project excerpts. Keep slides to no more "
     "than six concise sections and seven content items per section. Do not describe binary "
     "file manipulation; the local deterministic artifact tool will create the Office file. "
+    "The tool renders with the example palette from references/visual-design.md — its exact "
+    "semantic roles and verified contrast pairs — so when a storyboard or visual "
+    "specification names the palette to apply, name that palette with its stated provenance "
+    "rather than promising other colors. "
     "Do not emit an artifact_spec when presenting a preview or asking a decision."
 )
 MARKDOWN_RENDERER = MarkdownIt("commonmark", {"html": True, "linkify": False})
@@ -1668,6 +1680,20 @@ def _coerce_decision_payload(candidate: object) -> Optional[dict]:
     return {"question": question.strip()[:500], "options": cleaned_options}
 
 
+# The skill's portable fallback for clients without a native choice control
+# ('Suggested replies: "1" | "2" | ... | "decide for me"'). This app renders the
+# decision as buttons, so the line is duplicate chrome whenever a card is shown;
+# it stays only when no card was recovered, where typing a reply is the sole path.
+_SUGGESTED_REPLIES_LINE = re.compile(
+    r"^[ \t>*_-]*(?:\*\*)?suggested replies(?:\*\*)?\s*:[^\n]*$\n?",
+    re.IGNORECASE | re.MULTILINE,
+)
+
+
+def _strip_suggested_replies(content: str) -> str:
+    return _SUGGESTED_REPLIES_LINE.sub("", content).strip()
+
+
 def _extract_decision(content: str) -> tuple[str, Optional[dict]]:
     pattern = re.compile(
         r"```(?:decision|json)?\s*(\{.*?\})\s*```",
@@ -1682,7 +1708,7 @@ def _extract_decision(content: str) -> tuple[str, Optional[dict]]:
         decision = _coerce_decision_payload(candidate)
         if decision:
             cleaned_content = (content[: match.start()] + content[match.end() :]).strip()
-            return cleaned_content, decision
+            return _strip_suggested_replies(cleaned_content), decision
 
     trailing = _trailing_json_object(content)
     if trailing:
@@ -1690,8 +1716,11 @@ def _extract_decision(content: str) -> tuple[str, Optional[dict]]:
         decision = _coerce_decision_payload(candidate)
         if decision:
             cleaned_content = (content[:start] + content[end:]).strip()
-            return cleaned_content, decision
-    return content.strip(), _infer_decision_from_questions(content)
+            return _strip_suggested_replies(cleaned_content), decision
+    inferred = _infer_decision_from_questions(content)
+    if inferred:
+        return _strip_suggested_replies(content), inferred
+    return content.strip(), None
 
 
 def _collaboration_mode_instruction(mode: str) -> str:
@@ -1712,6 +1741,13 @@ def _collaboration_mode_instruction(mode: str) -> str:
             "three plain-language questions only when their answers materially change the result. "
             "Continue the workflow after the educator answers; do not repeatedly ask them to choose "
             "which internal document, blueprint, rubric, or metadata they want to provide."
+        )
+    if mode in ("Co-design", "Guided"):
+        instruction += (
+            " An approval covers only the piece just presented, never the remaining artifact "
+            "family. State what the next turn will produce if approved — the next piece, not "
+            "the full package — and treat skipping the remaining checkpoints as a mode change "
+            "only the educator can name."
         )
     return instruction
 

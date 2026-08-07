@@ -269,6 +269,7 @@ input:focus, select:focus, textarea:focus { border-color: var(--gold-dark); box-
 .decision-option strong, .decision-option small { display: block; }.decision-option strong { font-size: .96rem; }.decision-option small { margin-top: 5px; color: var(--muted); font-size: .8rem; line-height: 1.45; }
 .decision-option-arrow { color: var(--gold-dark); font-size: 1.2rem; }
 .decision-modal .full-button { width: calc(100% - 52px); margin-bottom: 26px; }
+.decision-modal #delegateDecisionButton { margin-bottom: 10px; }
 .artifact-list { margin-top: 20px; }
 .artifact-tool-launch { margin-bottom: 18px; }
 .artifact-tool-modal { width: min(820px, calc(100vw - 32px)); }
