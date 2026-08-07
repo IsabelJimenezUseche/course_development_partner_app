@@ -489,6 +489,34 @@ def test_skill_tool_contract_matches_validator_separator_rules():
     assert "column headings" not in server.SKILL_TOOL_CONTRACT
 
 
+def test_curriculum_map_validation_includes_practice_distribution(monkeypatch, tmp_path):
+    """The skill's curriculum-map template says --check-practice-distribution automates
+    one of its review rows; the app is the only validator runner in its workflow, so
+    the app must pass the flag or the automated check never runs anywhere."""
+    monkeypatch.setenv("APP_DATA_DIR", str(tmp_path))
+    settings = get_settings()
+    valid = _skill_fixture("course_curriculum_map", "valid.md")
+    _write_state_file(settings, "project-practice-dist", "course-curriculum-map.md", valid)
+
+    outcome = server._validate_state_file(
+        settings, "project-practice-dist", "course-curriculum-map.md"
+    )
+    assert outcome["status"] == "pass"
+
+    # Same outcome practiced twice in the same week, never distributed.
+    massed = valid + (
+        "| 4 | 2 | LO-1 | practice | none | Drill set A | Instructor feedback | 1 | approved |\n"
+        "| 5 | 2 | LO-1 | practice | none | Drill set B | Instructor feedback | 1 | approved |\n"
+    )
+    _write_state_file(settings, "project-practice-dist", "course-curriculum-map.md", massed)
+
+    outcome = server._validate_state_file(
+        settings, "project-practice-dist", "course-curriculum-map.md"
+    )
+    assert outcome["status"] == "incomplete"
+    assert any("massed" in finding["message"] for finding in outcome["findings"])
+
+
 def test_skill_tools_are_offered_to_the_model():
     names = {tool["function"]["name"] for tool in server.skill_tool_definitions()}
 

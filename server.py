@@ -758,6 +758,11 @@ def _validate_state_file(
             extra_args = ["--alignment-map", str(alignment)]
     elif script_name == "validate_artifact_manifest.py":
         extra_args = ["--check-paths"]
+    elif script_name == "validate_course_curriculum_map.py":
+        # The curriculum-map template tells instructors this check is automated;
+        # the app is the only validator runner in its workflow, so it opts in here.
+        # Massed practice reports as a gap (exit 2), never a hard error.
+        extra_args = ["--check-practice-distribution"]
     return _run_validator(settings, script_name, path, extra_args)
 
 
