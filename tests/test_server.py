@@ -1,4 +1,5 @@
 import json
+import re
 import socket
 import zipfile
 from io import BytesIO
@@ -128,6 +129,153 @@ def test_retired_engineering_profile_still_resolves_to_stem():
 def test_stem_profile_routes_beyond_engineering_wording():
     for text in ("Plan a laboratory session", "Draft a computing lab on uncertainty"):
         assert _infer_skill_profile([ChatMessage(role="user", content=text)]) == "stem"
+
+
+def test_framework_profile_loads_crosswalk_and_recording_state():
+    """The skill update added framework-crosswalk.md; a named framework must reach it."""
+    _, runtime = _load_skill_runtime(get_settings(), "framework")
+
+    assert runtime["loaded_files"] == [
+        "SKILL.md",
+        "references/framework-crosswalk.md",
+        "references/evidence-informed-design.md",
+    ]
+    assert runtime["loaded_assets"] == [
+        "assets/design-log.md",
+        "assets/source-register.md",
+    ]
+
+
+def test_framework_profile_is_available_through_the_api():
+    response = client.get("/api/skill", params={"profile": "framework"})
+
+    assert response.status_code == 200
+    assert "references/framework-crosswalk.md" in response.json()["loaded_files"]
+    assert client.get("/api/skill", params={"profile": "not-a-profile"}).status_code == 400
+
+
+def test_named_framework_routes_to_the_crosswalk_profile():
+    for text in (
+        "Map my course outcomes to the ABET student outcomes",
+        "How do these fit Bloom's taxonomy levels?",
+        "We teach with POGIL and want to keep the roles working",
+        "Our program is preparing for accreditation next year",
+        "I want to restructure this as a flipped classroom",
+    ):
+        assert _infer_skill_profile([ChatMessage(role="user", content=text)]) == "framework"
+
+
+def test_framework_words_inside_other_words_do_not_reroute():
+    """'diabetes' contains 'abet' and 'algal blooms' nearly contains "bloom's"."""
+    for text in (
+        "Plan a unit on diabetes for nursing students",
+        "Cover seasonal algal blooms in the ecology unit",
+    ):
+        assert _infer_skill_profile([ChatMessage(role="user", content=text)]) == "establish"
+
+
+def test_framework_mention_defers_to_the_specific_task_route():
+    """A rubric that cites ABET is rubric work; the crosswalk is for pure mapping asks."""
+    profile = _infer_skill_profile(
+        [ChatMessage(role="user", content="Draft a rubric for ABET outcome 2")]
+    )
+
+    assert profile == "assessment"
+
+
+def test_syllabus_and_delivery_adaptation_route_to_course_profile():
+    """The skill update added syllabi and online/hybrid adaptation to its scope."""
+    for text in (
+        "Draft a syllabus for my spring section",
+        "Move my seminar to hybrid delivery next term",
+        "Plan the online adaptation of my lecture course",
+    ):
+        assert _infer_skill_profile([ChatMessage(role="user", content=text)]) == "course"
+
+
+def test_ada_keyword_requires_a_whole_word():
+    profile = _infer_skill_profile(
+        [ChatMessage(role="user", content="Is this handout ADA compliant?")]
+    )
+    assert profile == "accessibility"
+
+    # "Adapt" must not be read as the ADA statute.
+    profile = _infer_skill_profile(
+        [ChatMessage(role="user", content="Adapt my seminar for hybrid delivery")]
+    )
+    assert profile == "course"
+
+
+def test_design_profile_supplies_the_verified_bibliography():
+    """SKILL.md forbids citing from memory, so the verified entries must be in the prompt."""
+    prompt, runtime = _load_skill_runtime(get_settings(), "design")
+
+    assert "references/bibliography.md" in runtime["loaded_files"]
+    assert "Anchor Bibliography" in prompt
+    assert "Freeman, S." in prompt  # a verified entry, not just the file's name
+
+
+def test_every_profile_route_names_installed_skill_files():
+    """A skill rename or removal must fail here, not as a 503 in front of a professor."""
+    settings = get_settings()
+    for profile, references in server.SKILL_REFERENCE_ROUTES.items():
+        for reference in references:
+            assert (settings.skill_dir / "references" / reference).is_file(), (
+                f"profile {profile} routes references/{reference}, which is not installed"
+            )
+        for asset in server.SKILL_ASSET_ROUTES.get(profile, []):
+            assert (settings.skill_dir / "assets" / asset).is_file(), (
+                f"profile {profile} routes assets/{asset}, which is not installed"
+            )
+
+
+def test_skill_references_are_routed_or_deliberately_excluded():
+    """When a skill update adds a reference (bibliography.md and framework-crosswalk.md
+    arrived this way), the app must either route it into a profile or record here why
+    it stays out of the prompt. An unlisted reference is an undecided one."""
+    skill_md = (get_settings().skill_dir / "SKILL.md").read_text(encoding="utf-8")
+    linked = set(re.findall(r"references/([a-z0-9-]+\.md)", skill_md))
+    routed = {
+        reference
+        for references in server.SKILL_REFERENCE_ROUTES.values()
+        for reference in references
+    }
+    deliberately_excluded = {
+        # The app pins its own five tools; connector and tool selection never reach the model.
+        "tool-routing.md",
+        "mcp-capability-contracts.md",
+        # Office production is delegated to the local deterministic artifact tool.
+        "rich-artifact-production.md",
+        "visual-design.md",
+        # The asset templates are supplied verbatim instead; they carry the schema.
+        "state-contract.md",
+        # External-search protocol; the app has no web retrieval, and the verified
+        # bibliography rides with the design profile instead.
+        "evidence-source-protocol.md",
+        # End-to-end narrative, too long for a per-turn prompt.
+        "worked-example.md",
+    }
+    assert not deliberately_excluded & routed, "an excluded reference became routed; prune it"
+    unrouted = linked - routed - deliberately_excluded
+    assert not unrouted, f"skill references neither routed nor excluded: {sorted(unrouted)}"
+
+
+def test_state_file_registry_matches_the_installed_assets_exactly():
+    """The registry is the write allow-list: a state file the skill ships but the app
+    does not register can never reach disk, and that silent refusal is exactly what a
+    skill update would produce. Fail loudly here instead."""
+    installed = {path.name for path in (get_settings().skill_dir / "assets").glob("*.md")}
+
+    assert installed == set(STATE_FILE_VALIDATORS)
+
+
+def test_registered_validators_are_installed():
+    scripts_dir = get_settings().skill_dir / "scripts"
+    expected = {name for name in STATE_FILE_VALIDATORS.values() if name}
+    expected.add(server.PROJECT_VALIDATOR)
+
+    for script in sorted(expected):
+        assert (scripts_dir / script).is_file(), f"scripts/{script} is not installed"
 
 
 def test_work_dir_defaults_to_the_app_directory(monkeypatch):
@@ -296,6 +444,33 @@ def test_skill_validator_reports_findings_from_an_invalid_fixture(monkeypatch, t
     findings = report["checks"][0]["findings"]
     assert findings, "the validator's stdout should be parsed into findings"
     assert {finding["level"] for finding in findings} & {"error", "gap"}
+
+
+def test_validator_folds_lookalike_dashes_after_skill_sanitization(monkeypatch, tmp_path):
+    """The updated skill folds typographic look-alikes instead of failing them, and the
+    app's tool contract now coaches ASCII hyphens for identifiers only. Pin the
+    relaxation so a future skill change that re-tightens it surfaces here."""
+    monkeypatch.setenv("APP_DATA_DIR", str(tmp_path))
+    settings = get_settings()
+    brief = _skill_fixture("design_state", "valid.md").replace("Co-design", "Co–design")
+    assert "Co–design" in brief  # en dash where the schema expects a hyphen
+    _write_state_file(settings, "project-endash-brief", "course-design-brief.md", brief)
+
+    outcome = server._validate_state_file(
+        settings, "project-endash-brief", "course-design-brief.md", "establish"
+    )
+
+    assert outcome["status"] == "pass"
+
+
+def test_skill_tool_contract_matches_validator_separator_rules():
+    """The prompt coaches the exact corrections the validators still enforce."""
+    prompt, _ = _load_skill_runtime(get_settings(), "design")
+
+    assert "semicolons, never commas" in prompt
+    assert "plain ASCII hyphen" in prompt
+    # The heading-dash coaching was retired when the skill started folding look-alikes.
+    assert "column headings" not in server.SKILL_TOOL_CONTRACT
 
 
 def test_skill_tools_are_offered_to_the_model():
@@ -1375,11 +1550,17 @@ def test_internal_contract_names_never_reach_the_professor():
 
 def _realistic_arc():
     import importlib.util
+    import sys
 
+    if "realistic_arc" in sys.modules:
+        return sys.modules["realistic_arc"]
     spec = importlib.util.spec_from_file_location(
         "realistic_arc", Path(__file__).resolve().parents[1] / "evaluations" / "realistic_arc.py"
     )
     module = importlib.util.module_from_spec(spec)
+    # Register before exec: the module uses postponed annotations, and dataclasses
+    # resolves them through sys.modules[cls.__module__] at class-creation time.
+    sys.modules[spec.name] = module
     spec.loader.exec_module(module)
     return module
 

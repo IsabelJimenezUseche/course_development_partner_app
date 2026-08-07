@@ -191,6 +191,7 @@ class ChatRequest(BaseModel):
         "auto",
         "establish",
         "design",
+        "framework",
         "artifact",
         "assessment",
         "accessibility",
@@ -295,7 +296,14 @@ STOPWORDS = {
 }
 SKILL_REFERENCE_ROUTES = {
     "establish": ["interaction-protocol.md"],
-    "design": ["design-workflow.md", "evidence-informed-design.md"],
+    # bibliography.md rides along because SKILL.md forbids citing from memory: when a
+    # design recommendation needs a citable source, the verified entries must be in
+    # the prompt or gpt-oss will invent references.
+    "design": ["design-workflow.md", "evidence-informed-design.md", "bibliography.md"],
+    # SKILL.md routes named frameworks (ABET, Bloom's, CDIO, UDL, POGIL, flipped...)
+    # through the crosswalk; evidence-informed-design carries the mechanisms the
+    # crosswalk's pedagogy-format table points into.
+    "framework": ["framework-crosswalk.md", "evidence-informed-design.md"],
     "artifact": ["artifact-patterns.md", "evidence-informed-design.md"],
     "assessment": ["assessment-quality.md", "artifact-patterns.md"],
     "accessibility": ["accessibility-and-compliance.md", "artifact-patterns.md"],
@@ -311,6 +319,9 @@ SKILL_PROFILE_ALIASES = {"engineering": "stem"}
 SKILL_ASSET_ROUTES = {
     "establish": ["course-design-brief.md", "project-index.md"],
     "design": ["alignment-map.md", "design-log.md"],
+    # SKILL.md's routing table: a supplied framework is recorded in the design log
+    # and, when authoritative, the source register.
+    "framework": ["design-log.md", "source-register.md"],
     "artifact": ["lesson-storyboard.md", "artifact-manifest.md"],
     "assessment": ["assessment-blueprint.md", "alignment-map.md"],
     "accessibility": ["accessibility-review.md"],
@@ -411,11 +422,11 @@ SKILL_TOOL_CONTRACT = (
     "- `run_validators` for the whole-project cross-file check.\n"
     "Treat a validator result as work to finish, not as a report to hand over. If a write "
     "comes back `fail` or `incomplete`, read the findings, correct that exact problem, and "
-    "call `write_state_file` again before replying. Common corrections: use plain ASCII "
-    "hyphens in column headings rather than look-alike dashes; write identifiers as `M-1` "
-    "or `LO-1` with a hyphen; separate multiple identifiers with semicolons, never commas; "
-    "and answer every template field rather than leaving one blank. When you reply to the "
-    "educator, describe the teaching decisions in plain language, not the tool mechanics."
+    "call `write_state_file` again before replying. Common corrections: write identifiers "
+    "with a plain ASCII hyphen as `M-1` or `LO-1`, never an en dash; separate multiple "
+    "identifiers with semicolons, never commas; and answer every template field rather "
+    "than leaving one blank. When you reply to the educator, describe the teaching "
+    "decisions in plain language, not the tool mechanics."
 )
 STATE_FILE_CONTRACT = (
     "If tools are unavailable, fall back to including "
@@ -468,6 +479,19 @@ ENVIRONMENT_FIELDS = {
 }
 
 
+# Supplied-framework names the skill's crosswalk covers. Word boundaries matter:
+# substring matching would route "diabetes" through "abet" and "algal blooms"
+# through "bloom", so short acronyms and possessives are anchored.
+FRAMEWORK_SIGNAL = re.compile(
+    r"\b(?:abet|cdio|udl|washington accord|bloom['’]s|solo taxonomy|"
+    r"depth of knowledge|universal design for learning|accreditation|"
+    r"pogil|peer instruction|just-in-time teaching|flipped classroom|"
+    r"flipped course|scale-up|problem-based learning|project-based learning|"
+    r"model-eliciting|productive failure|specifications grading|"
+    r"standards-based grading|mastery grading|ungrading)\b"
+)
+
+
 def _infer_skill_profile(messages: list[ChatMessage]) -> str:
     latest_text = next(
         (message.content.lower() for message in reversed(messages) if message.role == "user"),
@@ -475,19 +499,38 @@ def _infer_skill_profile(messages: list[ChatMessage]) -> str:
     )
     routes = [
         ("assessment", ("assessment", "exam", "quiz", "rubric", "grading", "score")),
-        ("accessibility", ("accessibility", "accessible", "ada", "wcag", "accommodation")),
+        # "ada" is a whole-word pattern: as a substring it reads "adapt", "adaptation",
+        # and "Canada" as the ADA statute.
+        ("accessibility", (
+            "accessibility", "accessible", re.compile(r"\bada\b"), "wcag", "accommodation",
+        )),
         ("stem", (
             "engineering", "computing", "laborator", "hazard", "safety", "uncertainty",
             "risk", "constraint", "stakeholder", "sociotechnical",
         )),
-        ("course", ("course map", "curriculum", "multi-week", "semester", "workload")),
+        ("course", (
+            "course map", "curriculum", "multi-week", "semester", "workload",
+            "syllabus", "syllabi", "online course", "online delivery", "online adaptation",
+            "hybrid course", "hybrid delivery", "hybrid adaptation", "hybrid format",
+        )),
         ("artifact", ("worksheet", "lesson", "activity", "slides", "study guide", "artifact")),
         ("validation", ("validate", "review", "audit", "check", "finalize")),
         ("design", ("misconception", "scaffold", "sequence", "learning mechanism", "evidence")),
     ]
     for profile, keywords in routes:
-        if any(keyword in latest_text for keyword in keywords):
-            return profile
+        for keyword in keywords:
+            matched = (
+                keyword.search(latest_text) is not None
+                if isinstance(keyword, re.Pattern)
+                else keyword in latest_text
+            )
+            if matched:
+                return profile
+    # A named framework with no more specific task attached routes to the crosswalk.
+    # Checked after the task routes: "a rubric for ABET outcome 2" is assessment work
+    # that happens to mention a framework, not framework-mapping work.
+    if FRAMEWORK_SIGNAL.search(latest_text):
+        return "framework"
     return "establish"
 
 

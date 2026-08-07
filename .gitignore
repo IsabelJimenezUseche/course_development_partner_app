@@ -5,3 +5,5 @@ evaluations/results/
 validation/results/
 !.env.example
 __pycache__/
+deliverable/
+course_development_partner
