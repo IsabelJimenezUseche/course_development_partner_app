@@ -198,6 +198,7 @@ class ChatRequest(BaseModel):
         "course",
         "stem",
         "engineering",
+        "data",
         "validation",
     ] = "auto"
 
@@ -312,6 +313,9 @@ SKILL_REFERENCE_ROUTES = {
     "accessibility": ["accessibility-and-compliance.md", "artifact-patterns.md", "visual-design.md"],
     "course": ["course-coherence-and-implementation.md", "design-workflow.md"],
     "stem": ["stem-authenticity.md", "artifact-patterns.md"],
+    # SKILL.md requires the exact-dataset check whenever students receive a dataset,
+    # a spreadsheet, or a chart to produce; data-task-fit.md carries that chain.
+    "data": ["data-task-fit.md", "artifact-patterns.md"],
     "validation": ["validation-checklists.md", "portability.md"],
 }
 # Profile names retired by an upstream skill revision, kept so that stored message
@@ -325,11 +329,18 @@ SKILL_ASSET_ROUTES = {
     # SKILL.md's routing table: a supplied framework is recorded in the design log
     # and, when authoritative, the source register.
     "framework": ["design-log.md", "source-register.md"],
-    "artifact": ["lesson-storyboard.md", "artifact-manifest.md"],
+    # production-plan.md rides with artifact work because visual-design.md (routed
+    # above) requires recording the applied palette there.
+    "artifact": ["lesson-storyboard.md", "artifact-manifest.md", "production-plan.md"],
     "assessment": ["assessment-blueprint.md", "alignment-map.md"],
     "accessibility": ["accessibility-review.md"],
-    "course": ["course-curriculum-map.md", "implementation-plan.md"],
+    "course": ["course-curriculum-map.md", "implementation-plan.md", "implementation-evidence-plan.md"],
     "stem": ["safety-review.md", "context-brief.md"],
+    # data-task-record.md is the re-executable record validate_data_task_record.py
+    # checks; the manifest's data-task-fit token must link a row in it, and
+    # data-task-fit.md requires disclosing generated or corrected data via the
+    # source register.
+    "data": ["data-task-record.md", "source-register.md", "artifact-manifest.md"],
     "validation": ["project-index.md", "artifact-manifest.md"],
 }
 # Portable state files the app can hold, mapped to the skill validator that checks
@@ -344,24 +355,33 @@ STATE_FILE_VALIDATORS = {
     "course-curriculum-map.md": "validate_course_curriculum_map.py",
     "artifact-manifest.md": "validate_artifact_manifest.py",
     "project-index.md": None,
-    "accessibility-review.md": None,
-    "capability-manifest.md": None,
+    # validate_release_record.py checks that these three carry an affirmative,
+    # unblocked release decision -- named owner, governing source, dates -- not
+    # just a copied template; it takes --kind per file, inferred from the name.
+    "accessibility-review.md": "validate_release_record.py",
+    # validate_handoff_state.py checks that these three carry usable content
+    # rather than an unfilled template; it takes --kind per file.
+    "capability-manifest.md": "validate_handoff_state.py",
     "context-brief.md": None,
-    "design-log.md": None,
+    "design-log.md": "validate_handoff_state.py",
+    # Re-runs each data-task-fit row against the dataset it names, so a claim in
+    # artifact-manifest.md's data-task-fit column can be re-checked, not just trusted.
+    "data-task-record.md": "validate_data_task_record.py",
     "implementation-evidence-plan.md": None,
     "implementation-plan.md": None,
     "lesson-storyboard.md": None,
-    "production-plan.md": None,
-    "safety-review.md": None,
-    "source-register.md": None,
+    "production-plan.md": "validate_release_record.py",
+    "safety-review.md": "validate_release_record.py",
+    "source-register.md": "validate_handoff_state.py",
 }
 # validate_project.py takes the project directory rather than a single file.
 PROJECT_VALIDATOR = "validate_project.py"
 DESIGN_PROFILES = ("establish", "produce", "handoff")
 VALIDATOR_TIMEOUT_SECONDS = 30
-# How many times the model may call tools before it must answer. Enough for
-# write -> validate -> read findings -> rewrite -> validate on a couple of files.
-MAX_TOOL_ITERATIONS = 6
+# How many times the model may call tools before it must answer. Sized for the
+# Auto cycle: design-log plus storyboard plus artifact writes, each with a
+# validate -> fix -> revalidate pass, and a reference fetch along the way.
+MAX_TOOL_ITERATIONS = 10
 MAX_TOOL_RESULT_CHARS = 20_000
 # Shared exit-code convention across every scripts/validate_*.py in the skill.
 VALIDATOR_EXIT_STATUS = {0: "pass", 1: "fail", 2: "incomplete"}
@@ -427,7 +447,11 @@ SKILL_TOOL_CONTRACT = (
     "- `read_skill_template` before writing a state file for the first time;\n"
     "- `write_state_file` to save it, which runs the file's validator and returns the "
     "findings;\n"
-    "- `run_validators` for the whole-project cross-file check.\n"
+    "- `run_validators` for the whole-project cross-file check;\n"
+    "- `read_skill_reference` when SKILL.md tells you to read a reference that is not "
+    "already in this prompt — never claim to have followed a reference you did not read;\n"
+    "- `validate_dataset` before releasing any data-based activity, to check that the "
+    "exact uploaded dataset supports the requested chart or statistic.\n"
     "Treat a validator result as work to finish, not as a report to hand over. If a write "
     "comes back `fail` or `incomplete`, read the findings, correct that exact problem, and "
     "call `write_state_file` again before replying. Common corrections: write identifiers "
@@ -515,22 +539,44 @@ def _infer_skill_profile(messages: list[ChatMessage]) -> str:
         "",
     )
     routes = [
-        ("assessment", ("assessment", "exam", "quiz", "rubric", "grading", "score")),
+        # "peer evaluation"/"peer review" belong here per assessment-quality.md §8,
+        # and must outrank the validation route's bare "review".
+        ("assessment", (
+            "assessment", "exam", "quiz", "rubric", "grading", "score",
+            "peer evaluation", "peer-evaluat", "peer assessment", "peer review",
+            "solution key", "answer key", "calibrat",
+        )),
         ("accessibility", (
             "accessibility", "accessible", ADA_SIGNAL, "wcag", "accommodation",
+            "screen reader", "alt text", "caption",
         )),
         ("stem", (
             "engineering", "computing", "laborator", "hazard", "safety", "uncertainty",
             "risk", "constraint", "stakeholder", "sociotechnical",
+            "context-rich", "contextualized",
         )),
         ("course", (
             "course map", "curriculum", "multi-week", "semester", "workload",
             "syllabus", "syllabi", "online course", "online delivery", "online adaptation",
             "hybrid course", "hybrid delivery", "hybrid adaptation", "hybrid format",
+            "capstone",
         )),
-        ("artifact", ("worksheet", "lesson", "activity", "slides", "study guide", "artifact")),
+        # Checked before the artifact route: a dataset-driven worksheet needs the
+        # exact-dataset chain from data-task-fit.md more than the generic patterns.
+        ("data", (
+            "dataset", "data set", "spreadsheet", "csv", "xlsx", "excel",
+            "chart", "histogram", "scatter", "data analysis",
+        )),
+        ("artifact", (
+            "worksheet", "lesson", "activity", "slides", "study guide", "artifact",
+            "storyboard", "handout", "problem set",
+        )),
         ("validation", ("validate", "review", "audit", "check", "finalize")),
-        ("design", ("misconception", "scaffold", "sequence", "learning mechanism", "evidence")),
+        ("design", (
+            "misconception", "scaffold", "sequence", "learning mechanism", "evidence",
+            "motivat", "self-efficacy", "belonging", "cognitive load",
+            "prior knowledge", "team learning", "group work", "collaborat",
+        )),
     ]
     for profile, keywords in routes:
         for keyword in keywords:
@@ -549,7 +595,38 @@ def _infer_skill_profile(messages: list[ChatMessage]) -> str:
     return "establish"
 
 
-def _load_skill_runtime(settings: Settings, profile: str) -> tuple[str, dict]:
+def _resolve_skill_profile(
+    requested: str, messages: list[ChatMessage], prior_rows=()
+) -> str:
+    """Resolve the profile for a turn, keeping mid-flow continuity.
+
+    Keyword inference sees only the newly typed message, so a continuation like
+    "yes, produce it" carries no routing signal and would collapse to establish,
+    dropping the references the work in progress depends on. When inference finds
+    no signal, the most recent assistant turn's profile carries forward; a topic
+    change names its own keywords and re-routes normally.
+    """
+    if requested != "auto":
+        return SKILL_PROFILE_ALIASES.get(requested, requested)
+    inferred = _infer_skill_profile(messages)
+    if inferred != "establish":
+        return inferred
+    for row in prior_rows:  # newest first
+        if row["role"] != "assistant":
+            continue
+        metadata = json.loads(row["metadata_json"] or "{}")
+        prior = (metadata.get("skill_runtime") or {}).get("profile") or ""
+        prior = SKILL_PROFILE_ALIASES.get(prior, prior)
+        if prior in SKILL_REFERENCE_ROUTES and prior != "establish":
+            return prior
+        if prior:
+            break  # the flow most recently sat at establish; stay there
+    return inferred
+
+
+def _load_skill_runtime(
+    settings: Settings, profile: str, mode: str = "Co-design"
+) -> tuple[str, dict]:
     profile = SKILL_PROFILE_ALIASES.get(profile, profile)
     if profile not in SKILL_REFERENCE_ROUTES:
         raise HTTPException(status_code=400, detail="Unknown skill profile")
@@ -561,8 +638,15 @@ def _load_skill_runtime(settings: Settings, profile: str) -> tuple[str, dict]:
             detail=f"Course skill not found at {skill_file}",
         )
 
+    reference_names = list(SKILL_REFERENCE_ROUTES[profile])
+    # The Guided, Rapid, and Auto rules live in the interaction protocol, which
+    # only the establish profile routes; a Guided/Rapid/Auto turn doing artifact
+    # or assessment work still needs those rules in the prompt, or the mode
+    # instruction references a file the model has never seen.
+    if mode in ("Guided", "Rapid", "Auto") and "interaction-protocol.md" not in reference_names:
+        reference_names.append("interaction-protocol.md")
     relative_files = ["SKILL.md"] + [
-        f"references/{filename}" for filename in SKILL_REFERENCE_ROUTES[profile]
+        f"references/{filename}" for filename in reference_names
     ]
     sections = []
     digest = hashlib.sha256()
@@ -582,9 +666,17 @@ def _load_skill_runtime(settings: Settings, profile: str) -> tuple[str, dict]:
 
     # Asset templates are supplied verbatim so the model fills a known structure
     # instead of inventing one the validators would then reject.
+    asset_names = list(SKILL_ASSET_ROUTES.get(profile, []))
+    # At Project/Course tier, Auto must record every self-answered decision card
+    # in the design log, so the template rides along regardless of profile. (At
+    # Focused tier the record folds into the deliverable instead and this
+    # template goes unused -- harmless to supply, since the model still decides
+    # whether the tier calls for it.)
+    if mode == "Auto" and "design-log.md" not in asset_names:
+        asset_names.append("design-log.md")
     loaded_assets = []
     asset_sections = []
-    for asset_name in SKILL_ASSET_ROUTES.get(profile, []):
+    for asset_name in asset_names:
         asset_path = settings.skill_dir / "assets" / asset_name
         if not asset_path.is_file():
             raise HTTPException(
@@ -775,6 +867,22 @@ def _validate_state_file(
         # the app is the only validator runner in its workflow, so it opts in here.
         # Massed practice reports as a gap (exit 2), never a hard error.
         extra_args = ["--check-practice-distribution"]
+    elif script_name == "validate_handoff_state.py":
+        # Mirrors validate_project.py's own wiring: handoff-level completeness
+        # (full source provenance, capability approval) only applies once the
+        # project has reached the handoff design profile.
+        extra_args = ["--kind", filename.removesuffix(".md")]
+        if design_profile == "handoff":
+            extra_args.append("--strict")
+    elif script_name == "validate_data_task_record.py":
+        # The default root is the record's own directory (state/), which
+        # rejects any dataset stored in this app's sibling sources/ directory
+        # as "outside the project" -- confinement is real, but state/ is not
+        # the project boundary here. --root supplies the true one, matching
+        # how validate_project.py's own cross-file check calls this validator.
+        extra_args = ["--root", str(_project_state_dir(settings, project_id).parent)]
+    elif script_name == "validate_release_record.py":
+        extra_args = ["--kind", filename.removesuffix(".md")]
     return _run_validator(settings, script_name, path, extra_args)
 
 
@@ -934,7 +1042,20 @@ def _validate_project_state(
     }
 
 
-def skill_tool_definitions() -> list[dict]:
+# Representations scripts/validate_dataset.py accepts; kept in sync by test.
+DATASET_REPRESENTATIONS = (
+    "bar", "box", "correlation", "grouped-comparison", "heatmap", "histogram",
+    "line", "mean", "pie", "regression", "scatter", "standard-deviation",
+    "uncertainty",
+)
+# The role vocabulary scripts/validate_dataset.py's --x/--y/... flags accept, and
+# the same tokens assets/data-task-record.md's "Column roles" field documents
+# (e.g. "x=mass_kg; y=extension_mm") -- keeping the tool's argument names identical
+# to that vocabulary means the model can copy one into the other unchanged.
+DATASET_COLUMN_ROLES = ("x", "y", "category", "series", "value", "order")
+
+
+def skill_tool_definitions(settings: Settings) -> list[dict]:
     """OpenAI-style tool schemas exposing the skill's assets and validators.
 
     The point is that the model works the way any tool-using agent does: fetch the
@@ -943,7 +1064,76 @@ def skill_tool_definitions() -> list[dict]:
     hyphen; an agent that runs the validator can.
     """
     state_files = sorted(STATE_FILE_VALIDATORS)
+    # SKILL.md instructs reading references that only some profiles pre-route;
+    # this tool keeps every instruction followable instead of aspirational.
+    reference_files = sorted(
+        path.name for path in (settings.skill_dir / "references").glob("*.md")
+    )
     return [
+        {
+            "type": "function",
+            "function": {
+                "name": "read_skill_reference",
+                "description": (
+                    "Read one of the skill's reference files that is not already in "
+                    "this prompt. Call this whenever SKILL.md routes you to a "
+                    "reference you have not seen, instead of assuming its content."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "file": {"type": "string", "enum": reference_files},
+                    },
+                    "required": ["file"],
+                },
+            },
+        },
+        {
+            "type": "function",
+            "function": {
+                "name": "validate_dataset",
+                "description": (
+                    "Run the skill's dataset validator over an uploaded CSV or XLSX "
+                    "source. Checks that the exact dataset supports the chart or "
+                    "statistic the activity asks students to produce. Call this "
+                    "before releasing any data-based activity, and reuse the same "
+                    "role assignments when writing the data-task-record.md row -- "
+                    "its 'Column roles' field uses this same x/y/category/series/"
+                    "value/order vocabulary."
+                ),
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "source_id": {
+                            "type": "string",
+                            "description": "The SRC-... identifier of the uploaded dataset",
+                        },
+                        "representation": {
+                            "type": "string",
+                            "enum": list(DATASET_REPRESENTATIONS),
+                        },
+                        **{
+                            role: {
+                                "type": "string",
+                                "description": f"Column playing the {role} role in the requested representation",
+                            }
+                            for role in DATASET_COLUMN_ROLES
+                        },
+                        "columns": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Additional column the instructions name; repeat for each",
+                        },
+                        "sheet": {
+                            "type": "string",
+                            "description": "Worksheet name for a multi-sheet XLSX workbook",
+                        },
+                        "min_rows": {"type": "integer"},
+                    },
+                    "required": ["source_id", "representation"],
+                },
+            },
+        },
         {
             "type": "function",
             "function": {
@@ -1061,9 +1251,65 @@ def _dispatch_skill_tool(
             "validator": STATE_FILE_VALIDATORS[filename],
         }
 
+    if name == "read_skill_reference":
+        filename = str(arguments.get("file", ""))
+        if not re.fullmatch(r"[a-z0-9-]+\.md", filename):
+            return {"error": f"Unknown reference: {filename}"}
+        path = settings.skill_dir / "references" / filename
+        if not path.is_file():
+            return {"error": f"Reference not installed: references/{filename}"}
+        content = path.read_text(encoding="utf-8")
+        # MAX_TOOL_RESULT_CHARS truncates the JSON envelope blindly; trimming the
+        # content here keeps the payload parseable and the truncation visible.
+        return {
+            "file": f"references/{filename}",
+            "content": content[:18_000],
+            "truncated": len(content) > 18_000,
+        }
+
     # Everything below needs somewhere to put the file.
     if not project_id:
         return {"error": "No project is open, so state files cannot be read or written."}
+
+    if name == "validate_dataset":
+        source_id = str(arguments.get("source_id", ""))
+        representation = str(arguments.get("representation", ""))
+        if not SOURCE_ID_PATTERN.fullmatch(source_id):
+            return {"error": f"Unknown source: {source_id}"}
+        if representation not in DATASET_REPRESENTATIONS:
+            return {"error": f"Unknown representation: {representation}"}
+        source_path = _source_dir(settings, project_id, source_id)
+        dataset = next(
+            (
+                source_path / f"original{suffix}"
+                for suffix in (".csv", ".xlsx")
+                if (source_path / f"original{suffix}").is_file()
+            ),
+            None,
+        )
+        if dataset is None:
+            return {"error": f"Source {source_id} has no CSV or XLSX dataset to validate."}
+        extra_args = ["--representation", representation]
+        for role in DATASET_COLUMN_ROLES:
+            value = arguments.get(role)
+            if isinstance(value, str) and value.strip():
+                extra_args += [f"--{role}", value.strip()[:120]]
+        for column in arguments.get("columns") or []:
+            extra_args += ["--column", str(column)[:120]]
+        sheet = arguments.get("sheet")
+        if isinstance(sheet, str) and sheet.strip():
+            extra_args += ["--sheet", sheet.strip()[:120]]
+        min_rows = arguments.get("min_rows")
+        if isinstance(min_rows, int) and min_rows > 0:
+            extra_args += ["--min-rows", str(min_rows)]
+        result = _run_validator(settings, "validate_dataset.py", dataset, extra_args)
+        # assets/data-task-record.md's "Dataset file" column is "a path relative
+        # to this file" -- this file being the record itself, which lives in the
+        # project's state directory. Hand back that exact relative path so the
+        # model can copy it into the row instead of guessing the layout.
+        state_dir = _project_state_dir(settings, project_id)
+        result["dataset_path_relative_to_state_dir"] = os.path.relpath(dataset, state_dir)
+        return result
 
     if name == "list_state_files":
         return {"state_files": _list_state_files(settings, project_id)}
@@ -1699,16 +1945,33 @@ def _extract_decision(content: str) -> tuple[str, Optional[dict]]:
         r"```(?:decision|json)?\s*(\{.*?\})\s*```",
         re.DOTALL | re.IGNORECASE,
     )
-    matches = list(pattern.finditer(content))
-    for match in reversed(matches):
+    # gpt-oss sometimes violates the skill's "one decision per turn" rule by
+    # emitting several fenced decision blocks in one reply -- exactly the
+    # bundled-cards failure the skill's own eval now screens for. Only the last
+    # valid block is ever selected as the active decision below, but every
+    # other one is still decision-shaped output, not prose; leaving it behind
+    # would show the professor raw leftover JSON instead of a clean message.
+    decision_spans: list[tuple[int, int]] = []
+    winner: Optional[dict] = None
+    for match in pattern.finditer(content):
         try:
             candidate = _load_model_json(match.group(1))
         except json.JSONDecodeError:
             continue
         decision = _coerce_decision_payload(candidate)
         if decision:
-            cleaned_content = (content[: match.start()] + content[match.end() :]).strip()
-            return _strip_suggested_replies(cleaned_content), decision
+            decision_spans.append((match.start(), match.end()))
+            winner = decision  # last valid block in document order wins
+
+    if winner:
+        cleaned_content = content
+        for start, end in sorted(decision_spans, reverse=True):
+            cleaned_content = cleaned_content[:start] + cleaned_content[end:]
+        # A block removed from the middle of the reply (the bundled-cards case)
+        # leaves the blank lines that surrounded it on both sides; collapse the
+        # run down to one paragraph break rather than showing the seam.
+        cleaned_content = re.sub(r"\n{3,}", "\n\n", cleaned_content)
+        return _strip_suggested_replies(cleaned_content.strip()), winner
 
     trailing = _trailing_json_object(content)
     if trailing:
@@ -1731,9 +1994,16 @@ def _collaboration_mode_instruction(mode: str) -> str:
     if mode == "Auto":
         instruction += (
             " Work non-interactively: do not ask the educator a question, present choices, emit a decision block, "
-            "request approval, or end with a feedback request. Select the strongest defensible recommendation, "
-            "complete all safe work, label assumptions, report validation and limitations, and identify any "
-            "nondelegable release blocker without converting it into a question."
+            "request approval, or end with a feedback request. Run the co-design cycle internally instead of "
+            "skipping it: form each consequential decision card and select the strongest defensible recommendation. "
+            "The engagement tier decides where that record lives, never whether one exists. At Project or Course "
+            "tier, record the card, the selection, and the rationale in design-log.md with write_state_file, and "
+            "create the checkpoint artifacts an interactive cycle would have presented — the lesson storyboard, "
+            "previews, specifications — as provisional state files rather than omitting them; internal means "
+            "unpresented, not unwritten. At Focused tier, do not create the state bundle or name tiers, modes, or "
+            "state files to the educator — fold the same record into the returned work instead: what was decided, "
+            "on what basis, and what remains open. Complete all safe work, label assumptions, report validation "
+            "and limitations, and identify any nondelegable release blocker without converting it into a question."
         )
     elif mode == "Co-design":
         instruction += (
@@ -3307,12 +3577,6 @@ async def chat(request: ChatRequest):
             detail="PURDUE_GENAI_MODEL_ID is not configured in app/.env",
         )
 
-    selected_profile = (
-        _infer_skill_profile(request.messages)
-        if request.skill_profile == "auto"
-        else SKILL_PROFILE_ALIASES.get(request.skill_profile, request.skill_profile)
-    )
-    skill_prompt, skill_runtime = _load_skill_runtime(settings, selected_profile)
     latest_user_message = next(
         (
             message.content
@@ -3325,6 +3589,7 @@ async def chat(request: ChatRequest):
         raise HTTPException(status_code=400, detail="A user message is required")
 
     project_mode = "Co-design"
+    prior_rows = []
     conversation_messages = [
         message.model_dump()
         for message in request.messages
@@ -3363,6 +3628,14 @@ async def chat(request: ChatRequest):
             {"role": "user", "content": latest_user_message},
         ]
 
+    # Resolved after the project fetch so the profile can carry forward from the
+    # stored conversation and the runtime can load the active mode's rules.
+    selected_profile = _resolve_skill_profile(
+        request.skill_profile, request.messages, prior_rows
+    )
+    skill_prompt, skill_runtime = _load_skill_runtime(
+        settings, selected_profile, project_mode
+    )
     payload_messages = [
         {"role": "system", "content": skill_prompt},
         *conversation_messages,
@@ -3385,7 +3658,7 @@ async def chat(request: ChatRequest):
         "Authorization": f"Bearer {settings.genai_api_key}",
         "Content-Type": "application/json",
     }
-    tools = skill_tool_definitions()
+    tools = skill_tool_definitions(settings)
     agent_messages = list(payload_messages)
     tool_trace: list[dict] = []
     upstream_content: dict = {}

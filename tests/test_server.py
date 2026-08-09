@@ -1,6 +1,10 @@
+import hashlib
 import json
+import os
 import re
 import socket
+import subprocess
+import sys
 import zipfile
 from io import BytesIO
 from pathlib import Path
@@ -546,10 +550,13 @@ def test_curriculum_map_validation_includes_practice_distribution(monkeypatch, t
 
 
 def test_skill_tools_are_offered_to_the_model():
-    names = {tool["function"]["name"] for tool in server.skill_tool_definitions()}
+    tools = server.skill_tool_definitions(get_settings())
+    names = {tool["function"]["name"] for tool in tools}
 
     assert names == {
         "read_skill_template",
+        "read_skill_reference",
+        "validate_dataset",
         "list_state_files",
         "read_state_file",
         "write_state_file",
@@ -557,12 +564,21 @@ def test_skill_tools_are_offered_to_the_model():
     }
     # The model must not be able to name a file the write allow-list would refuse.
     write = next(
-        tool for tool in server.skill_tool_definitions()
-        if tool["function"]["name"] == "write_state_file"
+        tool for tool in tools if tool["function"]["name"] == "write_state_file"
     )
     assert set(write["function"]["parameters"]["properties"]["file"]["enum"]) == set(
         STATE_FILE_VALIDATORS
     )
+    # The reference reader offers exactly the installed references, so every
+    # "Read references/X" instruction in SKILL.md is followable.
+    reader = next(
+        tool for tool in tools if tool["function"]["name"] == "read_skill_reference"
+    )
+    installed = {
+        path.name
+        for path in (get_settings().skill_dir / "references").glob("*.md")
+    }
+    assert set(reader["function"]["parameters"]["properties"]["file"]["enum"]) == installed
 
 
 def test_write_state_file_tool_returns_validator_findings(monkeypatch, tmp_path):
@@ -618,6 +634,337 @@ def test_read_skill_template_tool_serves_the_installed_asset():
 
     assert result["validator"] == "validate_alignment_map.py"
     assert "Cognitive demand" in result["template"]
+
+
+def test_read_skill_reference_tool_serves_unrouted_references():
+    """SKILL.md routes the model to references only some profiles pre-load; the
+    reader keeps every such instruction followable instead of aspirational."""
+    result = server._dispatch_skill_tool(
+        get_settings(), None, "read_skill_reference",
+        {"file": "rich-artifact-production.md"},
+    )
+
+    assert result["file"] == "references/rich-artifact-production.md"
+    assert "production" in result["content"].lower()
+
+    refused = server._dispatch_skill_tool(
+        get_settings(), None, "read_skill_reference", {"file": "../SKILL.md"}
+    )
+    assert "error" in refused
+
+
+def test_validate_dataset_tool_runs_the_skill_dataset_validator(monkeypatch, tmp_path):
+    """SKILL.md requires the exact-dataset check before releasing a data-based
+    activity; the tool runs it against the uploaded source."""
+    monkeypatch.setenv("APP_DATA_DIR", str(tmp_path))
+    settings = get_settings()
+    project_id = "project-datasettool1"
+    source_id = "SRC-ABCDEF012345"
+    source_dir = server._source_dir(settings, project_id, source_id)
+    source_dir.mkdir(parents=True)
+    # Sequential integers (1, 2, 3, ...) read as a row identifier to the
+    # validator's data-quality heuristic, not a measurement -- use varied
+    # floats so the check exercises paired-quantitative fit, not that gap.
+    rows = "\n".join(f"{1.2 + i * 0.37:.2f},{4.1 * (1.2 + i * 0.37) - 0.1:.2f}" for i in range(12))
+    (source_dir / "original.csv").write_text(f"x,y\n{rows}\n", encoding="utf-8")
+
+    result = server._dispatch_skill_tool(
+        settings, project_id, "validate_dataset",
+        {"source_id": source_id, "representation": "scatter", "x": "x", "y": "y"},
+    )
+    assert result["script"] == "scripts/validate_dataset.py"
+    assert result["status"] == "pass"
+    # assets/data-task-record.md's "Dataset file" column wants a path relative
+    # to the record itself, which lives in the project's state directory.
+    assert result["dataset_path_relative_to_state_dir"] == os.path.join(
+        "..", "sources", source_id, "original.csv"
+    )
+
+    missing = server._dispatch_skill_tool(
+        settings, project_id, "validate_dataset",
+        {"source_id": "SRC-000000000000", "representation": "scatter"},
+    )
+    assert "error" in missing
+
+
+def test_validate_dataset_tool_passes_role_and_sheet_arguments(monkeypatch, tmp_path):
+    """scripts/validate_dataset.py now pairs roles (--x/--y/...) rather than
+    accepting bare --column for representations that require paired columns;
+    the generic 'columns' list alone is no longer enough for a scatter plot."""
+    monkeypatch.setenv("APP_DATA_DIR", str(tmp_path))
+    settings = get_settings()
+    project_id = "project-datasettool2"
+    source_id = "SRC-123456789ABC"
+    source_dir = server._source_dir(settings, project_id, source_id)
+    source_dir.mkdir(parents=True)
+    (source_dir / "original.csv").write_text(
+        "region,total\n" + "\n".join(f"r{i},{i * 3}" for i in range(1, 9)) + "\n",
+        encoding="utf-8",
+    )
+
+    result = server._dispatch_skill_tool(
+        settings, project_id, "validate_dataset",
+        {
+            "source_id": source_id,
+            "representation": "bar",
+            "category": "region",
+            "value": "total",
+        },
+    )
+    assert result["status"] == "pass"
+
+
+def test_dataset_representation_enum_matches_the_installed_script_exactly():
+    """A drift in either direction is a real bug: a token missing from the app
+    means the model can never request it; a stale token means the app offers a
+    representation the installed validator no longer accepts."""
+    help_text = subprocess.run(
+        [sys.executable, "scripts/validate_dataset.py", "--help"],
+        cwd=str(get_settings().skill_dir),
+        capture_output=True, text=True, check=True,
+    ).stdout
+    match = re.search(r"--representation\s+\{([^}]+)\}", help_text)
+    installed = set(match.group(1).split(","))
+    assert set(server.DATASET_REPRESENTATIONS) == installed
+
+
+def test_dataset_column_roles_match_the_installed_script():
+    help_text = subprocess.run(
+        [sys.executable, "scripts/validate_dataset.py", "--help"],
+        cwd=str(get_settings().skill_dir),
+        capture_output=True, text=True, check=True,
+    ).stdout
+    for role in server.DATASET_COLUMN_ROLES:
+        assert f"--{role} " in help_text, role
+
+
+def test_handoff_state_files_now_run_their_validator(monkeypatch, tmp_path):
+    """The skill update added validate_handoff_state.py for the design log, source
+    register, and capability manifest; a write must return its findings."""
+    monkeypatch.setenv("APP_DATA_DIR", str(tmp_path))
+    settings = get_settings()
+    template = (settings.skill_dir / "assets" / "design-log.md").read_text(
+        encoding="utf-8"
+    )
+
+    result = server._dispatch_skill_tool(
+        settings, "project-handoffstate1", "write_state_file",
+        {"file": "design-log.md", "content": template},
+    )
+
+    validation = result["validation"]
+    assert validation["script"] == "scripts/validate_handoff_state.py"
+    assert validation["status"] == "incomplete"
+    assert any(
+        "decision" in finding["message"].lower()
+        for finding in validation["findings"]
+    )
+
+
+def test_data_task_record_is_registered_and_routed(monkeypatch, tmp_path):
+    """The skill's re-executable data-task-fit chain: a manifest row claiming
+    the data-task-fit token must link a row in data-task-record.md, and
+    scripts/validate_data_task_record.py re-runs it against the dataset."""
+    monkeypatch.setenv("APP_DATA_DIR", str(tmp_path))
+    settings = get_settings()
+    assert STATE_FILE_VALIDATORS["data-task-record.md"] == "validate_data_task_record.py"
+
+    template = server._dispatch_skill_tool(
+        settings, None, "read_skill_template", {"file": "data-task-record.md"}
+    )
+    assert template["validator"] == "validate_data_task_record.py"
+
+    result = server._dispatch_skill_tool(
+        settings, "project-datatask1", "write_state_file",
+        {"file": "data-task-record.md", "content": template["template"]},
+    )
+    assert result["validation"]["script"] == "scripts/validate_data_task_record.py"
+
+    _, runtime = _load_skill_runtime(settings, "data")
+    assert "assets/data-task-record.md" in runtime["loaded_assets"]
+
+
+def test_data_task_record_confines_paths_to_the_true_project_root(monkeypatch, tmp_path):
+    """scripts/validate_data_task_record.py checks that a recorded dataset stays
+    inside the project, but defaults to treating the record's own directory
+    (state/) as that boundary. This app stores uploaded datasets in a sibling
+    sources/ directory, so a correctly-authored row referencing
+    ../sources/<SRC-ID>/original.csv would be wrongly rejected as an escape
+    unless the app supplies the true project root via --root."""
+    monkeypatch.setenv("APP_DATA_DIR", str(tmp_path))
+    settings = get_settings()
+    project_id = "project-datataskroot1"
+    source_id = "SRC-CCCCCCCCCCCC"
+    source_dir = server._source_dir(settings, project_id, source_id)
+    source_dir.mkdir(parents=True)
+    rows = "\n".join(f"{1.2 + i * 0.37:.2f},{4.1 * (1.2 + i * 0.37) - 0.1:.2f}" for i in range(12))
+    csv_path = source_dir / "original.csv"
+    csv_path.write_text(f"mass_kg,extension_mm\n{rows}\n", encoding="utf-8")
+    digest = hashlib.sha256(csv_path.read_bytes()).hexdigest()
+
+    content = (
+        "# Data–Task Fit Record\n\n- Schema version: 1.0\n- Last updated: 2026-08-09\n\n"
+        "| Artifact ID | Dataset file | Dataset SHA-256 | Dataset version or date | Worksheet "
+        "| Representation | Column roles | Expected student output | Intended interpretation "
+        "| Execution method | Execution evidence | Executed on | Result |\n"
+        "|---|---|---|---|---|---|---|---|---|---|---|---|---|\n"
+        f"| WS-1 | ../sources/{source_id}/original.csv | {digest} | 2026-08-09 |  | scatter "
+        "| x=mass_kg; y=extension_mm | Fitted line with slope | Extension rises with mass "
+        "| manual |  | 2026-08-09 | Produced; slope about 4.1 |\n"
+    )
+    result = server._dispatch_skill_tool(
+        settings, project_id, "write_state_file",
+        {"file": "data-task-record.md", "content": content},
+    )
+    assert result["validation"]["status"] == "pass", result["validation"]["findings"]
+
+
+def test_release_records_run_validate_release_record(monkeypatch, tmp_path):
+    """safety-review.md, accessibility-review.md, and production-plan.md used to
+    have no validator at all -- a copied, unfilled template could reach
+    teaching-ready status. scripts/validate_release_record.py now checks each
+    carries an affirmative, unblocked decision with a named owner and dates."""
+    monkeypatch.setenv("APP_DATA_DIR", str(tmp_path))
+    settings = get_settings()
+    for filename in ("safety-review.md", "accessibility-review.md", "production-plan.md"):
+        assert STATE_FILE_VALIDATORS[filename] == "validate_release_record.py", filename
+
+        template = server._dispatch_skill_tool(
+            settings, None, "read_skill_template", {"file": filename}
+        )
+        assert template["validator"] == "validate_release_record.py"
+
+        result = server._dispatch_skill_tool(
+            settings, "project-releaserecord1", "write_state_file",
+            {"file": filename, "content": template["template"]},
+        )
+        validation = result["validation"]
+        assert validation["script"] == "scripts/validate_release_record.py", filename
+        # A blank copied template must never look like a completed review.
+        assert validation["status"] == "incomplete", filename
+        assert validation["findings"], filename
+
+
+def test_handoff_state_validation_goes_strict_only_at_handoff_profile(monkeypatch, tmp_path):
+    """validate_project.py only passes --strict once the project has reached the
+    handoff design profile; the app's per-file validation must match, or a
+    source register that is fine mid-project would block earlier phases."""
+    monkeypatch.setenv("APP_DATA_DIR", str(tmp_path))
+    settings = get_settings()
+    project_id = "project-strictcheck1"
+    # Filled enough to satisfy the core (non-strict) fields but missing the
+    # handoff-only provenance columns (owner/publisher, stable reference, ...).
+    content = (
+        "# Source Register\n\n- Schema version: 1.0\n- Last updated: 2026-01-01\n\n"
+        "| Source ID | Title | Authority type | Owner/publisher | Publication/revision date | "
+        "Stable reference | Last verified | Population/context and fit | Strength/limits | "
+        "License/reuse | Supported claim or artifact | Status |\n"
+        "|---|---|---|---|---|---|---|---|---|---|---|---|\n"
+        "| SRC-1 | A study | scholarly | | | | | | | | Backs the sequencing choice | verified |\n"
+    )
+    server._write_state_file(settings, project_id, "source-register.md", content)
+
+    lenient = server._validate_state_file(
+        settings, project_id, "source-register.md", design_profile="establish"
+    )
+    strict = server._validate_state_file(
+        settings, project_id, "source-register.md", design_profile="handoff"
+    )
+    assert lenient["status"] == "pass"
+    assert strict["status"] == "incomplete"
+    assert any("owner/publisher" in f["message"] for f in strict["findings"])
+
+
+def test_guided_rapid_auto_modes_load_the_interaction_protocol_everywhere():
+    """The mode instruction tells the model to apply the interaction-protocol
+    rules; outside the establish profile those rules must still reach the prompt."""
+    settings = get_settings()
+    for mode in ("Guided", "Rapid", "Auto"):
+        _, runtime = _load_skill_runtime(settings, "artifact", mode)
+        assert "references/interaction-protocol.md" in runtime["loaded_files"], mode
+    _, co_design = _load_skill_runtime(settings, "artifact", "Co-design")
+    assert "references/interaction-protocol.md" not in co_design["loaded_files"]
+
+
+def test_auto_mode_supplies_the_design_log_template():
+    """Auto must record every self-answered decision card in design-log.md, so
+    the template rides along regardless of profile."""
+    _, runtime = _load_skill_runtime(get_settings(), "artifact", "Auto")
+    assert "assets/design-log.md" in runtime["loaded_assets"]
+
+
+def test_auto_instruction_requires_recorded_cards_and_state():
+    instruction = _collaboration_mode_instruction("Auto")
+    assert "do not ask the educator a question" in instruction
+    assert "design-log.md" in instruction
+    assert "unpresented, not unwritten" in instruction
+    # Tier-scoping: the skill moved from "always design-log.md" to "the tier
+    # decides where the record lives" -- Focused tier folds it into the
+    # deliverable instead of creating the state bundle.
+    assert "Focused tier" in instruction
+    assert "do not create the state bundle" in instruction
+
+
+def test_profile_carries_forward_when_a_continuation_has_no_keywords():
+    prior_rows = [
+        {
+            "role": "assistant",
+            "metadata_json": json.dumps({"skill_runtime": {"profile": "artifact"}}),
+        },
+        {"role": "user", "metadata_json": "{}"},
+    ]
+
+    profile = server._resolve_skill_profile(
+        "auto",
+        [ChatMessage(role="user", content="Yes, produce it as we discussed.")],
+        prior_rows,
+    )
+    assert profile == "artifact"
+
+    # A topic change names its own keywords and re-routes normally.
+    profile = server._resolve_skill_profile(
+        "auto",
+        [ChatMessage(role="user", content="Now draft the quiz rubric.")],
+        prior_rows,
+    )
+    assert profile == "assessment"
+
+    # No history: the continuation stays at establish.
+    assert server._resolve_skill_profile(
+        "auto", [ChatMessage(role="user", content="Yes, go ahead.")], []
+    ) == "establish"
+
+
+def test_dataset_requests_route_to_the_data_profile_with_the_fit_reference():
+    """SKILL.md requires data-task-fit.md whenever students receive a dataset,
+    a spreadsheet, or a chart to produce."""
+    for text in (
+        "Build a worksheet where students plot a scatter chart from this dataset",
+        "Make a spreadsheet activity on unit conversions",
+        "Students should produce a histogram of the survey results",
+    ):
+        assert _infer_skill_profile([ChatMessage(role="user", content=text)]) == "data", text
+
+    _, runtime = _load_skill_runtime(get_settings(), "data")
+    assert "references/data-task-fit.md" in runtime["loaded_files"]
+    assert "assets/source-register.md" in runtime["loaded_assets"]
+    assert "assets/data-task-record.md" in runtime["loaded_assets"]
+
+
+def test_description_scope_keywords_reach_their_profiles():
+    """The skill's own description names work the router previously missed."""
+    cases = {
+        "Design a peer evaluation for the team project": "assessment",
+        "Students submit a peer review of each lab report": "assessment",
+        "Draft the solution key for problem set 3": "assessment",
+        "My students lose motivation halfway through the term": "design",
+        "How do I build belonging in my first-year section?": "design",
+        "Storyboard the lecture video introduction": "artifact",
+        "Plan the capstone milestones": "course",
+        "Does this handout work with a screen reader?": "accessibility",
+    }
+    for text, expected in cases.items():
+        assert _infer_skill_profile([ChatMessage(role="user", content=text)]) == expected, text
 
 
 def test_state_file_round_trip_through_the_api(monkeypatch, tmp_path):
@@ -851,6 +1198,28 @@ def test_structured_decision_is_removed_and_parsed():
     assert content == "Choose an evidence pattern."
     assert decision["question"] == "Which pattern?"
     assert len(decision["options"]) == 2
+
+
+def test_bundled_decision_cards_are_all_removed_not_just_the_selected_one():
+    """The skill's own eval added check_single_decision_per_turn to catch gpt-oss
+    bundling several decision cards in one reply. The UI can only act on one, but
+    leaving the others as raw JSON fences would show the professor unparsed
+    leftovers instead of a clean message."""
+    content, decision = _extract_decision(
+        "Decision 1: pick a pattern.\n\n```decision\n"
+        '{"question":"Which pattern?","options":['
+        '{"label":"A (Recommended)","description":"First","value":"a"},'
+        '{"label":"B","description":"Second","value":"b"}]}\n```\n\n'
+        "Decision 2: pick a format.\n\n```decision\n"
+        '{"question":"Which format?","options":['
+        '{"label":"C (Recommended)","description":"Third","value":"c"},'
+        '{"label":"D","description":"Fourth","value":"d"}]}\n```'
+    )
+
+    assert "```" not in content
+    assert "question" not in content.lower() or "Which" not in content
+    assert decision["question"] == "Which format?"  # last block wins, as before
+    assert content == "Decision 1: pick a pattern.\n\nDecision 2: pick a format."
 
 
 def test_suggested_replies_line_is_stripped_when_the_native_card_renders():
